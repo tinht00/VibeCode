@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Flow Batch Generator</title>
+  <style>
+    :root {
+      --bg: #f6f1e8;
+      --panel: rgba(255, 252, 246, 0.96);
+      --panel-strong: #fffaf1;
+      --line: rgba(41, 34, 24, 0.12);
+      --text: #221b14;
+      --muted: #6e6254;
+      --accent: #c44f2b;
+      --accent-strong: #8e2f14;
+      --success: #26734d;
+      --danger: #a83232;
+      --shadow: 0 18px 40px rgba(68, 43, 18, 0.12);
+      --radius: 18px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      margin: 0;
+      width: 100%;
+      min-height: 100%;
+      font-family: "Segoe UI", "Helvetica Neue", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top right, rgba(196, 79, 43, 0.2), transparent 34%),
+        radial-gradient(circle at bottom left, rgba(38, 115, 77, 0.12), transparent 28%),
+        linear-gradient(180deg, #f7f3eb 0%, #efe6d8 100%);
+    }
+
+    main {
+      padding: 18px;
+      min-height: 100vh;
+    }
+
+    .hero,
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      padding: 16px;
+      box-shadow: var(--shadow);
+      margin-bottom: 12px;
+    }
+
+    .hero h1 {
+      margin: 0 0 8px;
+      font-size: 24px;
+      line-height: 1.15;
+    }
+
+    .hero p,
+    .hint {
+      margin: 0;
+      font-size: 12px;
+      line-height: 1.5;
+      color: var(--muted);
+    }
+
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-bottom: 12px;
+    }
+
+    .field label {
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    input,
+    textarea,
+    button {
+      font: inherit;
+    }
+
+    input,
+    textarea {
+      width: 100%;
+      border: 1px solid rgba(41, 34, 24, 0.14);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.9);
+      color: var(--text);
+      padding: 12px 13px;
+      transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
+    }
+
+    input:focus,
+    textarea:focus {
+      outline: none;
+      border-color: rgba(196, 79, 43, 0.62);
+      box-shadow: 0 0 0 4px rgba(196, 79, 43, 0.12);
+      transform: translateY(-1px);
+    }
+
+    textarea {
+      min-height: 176px;
+      resize: vertical;
+      line-height: 1.45;
+    }
+
+    .actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 12px;
+    }
+
+    button {
+      border: none;
+      border-radius: 999px;
+      padding: 12px 16px;
+      cursor: pointer;
+      font-weight: 700;
+      transition: transform 0.2s ease, box-shadow 0.2s ease, opacity 0.2s ease;
+    }
+
+    button:hover:not(:disabled) {
+      transform: translateY(-1px);
+      box-shadow: 0 12px 20px rgba(56, 32, 14, 0.15);
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.56;
+      box-shadow: none;
+    }
+
+    .button-primary {
+      background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+      color: #fff9f3;
+    }
+
+    .button-secondary {
+      background: rgba(34, 27, 20, 0.08);
+      color: var(--text);
+    }
+
+    .status-card {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+
+    .metric {
+      border: 1px solid var(--line);
+      background: var(--panel-strong);
+      border-radius: 14px;
+      padding: 12px;
+    }
+
+    .metric .label {
+      display: block;
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    .metric .value {
+      display: block;
+      font-size: 18px;
+      font-weight: 700;
+    }
+
+    .message-box {
+      min-height: 44px;
+      border-radius: 14px;
+      padding: 10px 12px;
+      background: rgba(34, 27, 20, 0.05);
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+
+    .message-box.error {
+      background: rgba(168, 50, 50, 0.1);
+      color: var(--danger);
+    }
+
+    .message-box.success {
+      background: rgba(38, 115, 77, 0.11);
+      color: var(--success);
+    }
+
+    .prompt-preview-panel {
+      border: 1px solid rgba(41, 34, 24, 0.12);
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.62);
+      padding: 12px;
+      margin-top: 10px;
+    }
+
+    .prompt-preview-header,
+    .gallery-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+
+    .prompt-preview-title,
+    .gallery-header h2 {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 700;
+    }
+
+    .prompt-preview-count,
+    .gallery-count {
+      font-size: 11px;
+      color: var(--muted);
+      font-weight: 700;
+    }
+
+    .prompt-preview-list,
+    .gallery-grid {
+      display: grid;
+      gap: 8px;
+      max-height: 280px;
+      overflow-y: auto;
+    }
+
+    .prompt-preview-item,
+    .gallery-item {
+      border: 1px solid rgba(41, 34, 24, 0.1);
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.85);
+    }
+
+    .prompt-preview-item {
+      padding: 10px 12px;
+    }
+
+    .prompt-preview-item-header {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 6px;
+      font-size: 11px;
+      color: var(--muted);
+      font-weight: 700;
+    }
+
+    .prompt-preview-item-text {
+      font-size: 12px;
+      line-height: 1.45;
+      color: var(--text);
+      display: -webkit-box;
+      -webkit-line-clamp: 3;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+
+    .prompt-preview-empty,
+    .prompt-preview-error,
+    .gallery-empty {
+      border-radius: 12px;
+      padding: 12px;
+      font-size: 12px;
+      line-height: 1.45;
+      color: var(--muted);
+      background: rgba(34, 27, 20, 0.05);
+    }
+
+    .prompt-preview-error {
+      background: rgba(168, 50, 50, 0.1);
+      color: var(--danger);
+    }
+
+    .gallery-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .gallery-empty {
+      grid-column: 1 / -1;
+      border: 1px dashed rgba(41, 34, 24, 0.18);
+      background: rgba(255, 255, 255, 0.46);
+    }
+
+    .gallery-item {
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .thumb {
+      width: 100%;
+      aspect-ratio: 1 / 1;
+      object-fit: cover;
+      background: linear-gradient(135deg, rgba(34, 27, 20, 0.08), rgba(196, 79, 43, 0.08));
+    }
+
+    .gallery-body {
+      padding: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .gallery-body label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .prompt-preview {
+      font-size: 12px;
+      line-height: 1.4;
+      color: var(--muted);
+      display: -webkit-box;
+      -webkit-line-clamp: 3;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      min-height: 48px;
+    }
+
+    .gallery-meta {
+      font-size: 11px;
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <h1>Flow Batch Generator</h1>
+      <p>
+        Chỉ giữ luồng tối giản: nhập và rà soát prompt, quét ảnh đang có trên Flow,
+        chọn ảnh cần giữ, rồi bấm tải trực tiếp từ menu trên từng card ảnh.
+      </p>
+    </section>
+
+    <section class="panel">
+      <div class="field">
+        <label for="promptsInput">Danh sách prompt</label>
+        <textarea
+          id="promptsInput"
+          placeholder='Dán JSON array chuỗi hoặc object có "full_prompt", hoặc nhập plain text và ngăn mỗi prompt bằng một dòng trống.'
+        ></textarea>
+        <p class="hint">
+          Phần này dùng để rà soát và lọc prompt. Extension không còn tự generate hay crop ảnh nữa.
+        </p>
+      </div>
+
+      <div class="field">
+        <label for="galleryFilterInput">Lọc prompt hoặc ảnh</label>
+        <input
+          id="galleryFilterInput"
+          type="text"
+          placeholder="Gõ từ khóa để lọc prompt và gallery theo tiêu đề hoặc caption"
+        />
+      </div>
+
+      <div class="prompt-preview-panel">
+        <div class="prompt-preview-header">
+          <span class="prompt-preview-title">Danh sách prompt đã nhận diện</span>
+          <span id="promptPreviewCount" class="prompt-preview-count">0 prompt</span>
+        </div>
+        <div id="promptPreviewContainer" class="prompt-preview-list"></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="status-card">
+        <div class="metric">
+          <span class="label">Ảnh đang có</span>
+          <span id="scannedCountValue" class="value">0</span>
+        </div>
+        <div class="metric">
+          <span class="label">Đã chọn</span>
+          <span id="selectedCountValue" class="value">0</span>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>Trạng thái chi tiết</label>
+        <div id="messageBox" class="message-box">
+          Mở đúng tab Flow, bấm “Nhận diện ảnh hiện có”, sau đó chọn ảnh cần tải.
+        </div>
+      </div>
+
+      <div class="actions">
+        <button id="scanSessionButton" class="button-primary">Nhận diện ảnh hiện có</button>
+        <button id="downloadFromFlowButton" class="button-secondary">Tải ảnh đã chọn từ Flow</button>
+        <button id="clearGalleryButton" class="button-secondary">Xóa gallery</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="gallery-header">
+        <h2>Gallery Kết Quả</h2>
+        <span id="galleryCount" class="gallery-count">0 ảnh</span>
+      </div>
+      <div id="galleryContainer" class="gallery-grid"></div>
+    </section>
+  </main>
+
+  <script src="popup.js"></script>
+</body>
+</html>
