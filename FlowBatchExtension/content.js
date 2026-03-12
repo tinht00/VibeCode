@@ -180,6 +180,31 @@
       return false;
     }
 
+    if (message.type === "FLOW_FILL_PROMPT") {
+      void fillPromptOnDemand(message.payload)
+        .then((result) => sendResponse({ ok: true, ...result }))
+        .catch((error) => sendResponse({ ok: false, error: error.message || "Không thể điền prompt vào Flow." }));
+      return true;
+    }
+
+    if (message.type === "FLOW_AUTOFILL_PROMPTS") {
+      void validateAutofillRequest(message.payload)
+        .then(() => {
+          runtimeState.isRunning = true;
+          runtimeState.stopRequested = false;
+          void runAutofillSequenceSafely(message.payload);
+          sendResponse({ ok: true, started: true });
+        })
+        .catch((error) => sendResponse({ ok: false, error: error.message || "Không thể chạy tự động prompt." }));
+      return true;
+    }
+
+    if (message.type === "FLOW_AUTOFILL_STOP") {
+      runtimeState.stopRequested = true;
+      sendResponse({ ok: true, stopping: true });
+      return false;
+    }
+
     if (message.type === "FLOW_SYNC_SESSION_IMAGES") {
       try {
         validatePageContext();
@@ -228,6 +253,123 @@
       throw new Error(
         "Không tìm thấy nút generate của Flow. Hãy bổ sung selector vào FLOW_HINTS.generateButton hoặc kiểm tra xem composer đã hiện đầy đủ chưa."
       );
+    }
+  }
+
+  async function fillPromptOnDemand(payload) {
+    if (runtimeState.isRunning) {
+      throw new Error("Batch đang chạy. Hãy dừng batch trước khi điền prompt thủ công.");
+    }
+
+    const prompt = String(payload?.prompt || "").trim();
+    if (!prompt) {
+      throw new Error("Prompt rỗng, không thể điền vào Flow.");
+    }
+
+    validatePageContext();
+    await ensureComposerReady();
+    const promptInput = await populatePromptEditor(prompt);
+    if (!promptInput) {
+      throw new Error("Không thể điền prompt vào composer của Flow. Hãy kiểm tra lại UI hiện tại của Flow.");
+    }
+
+    return {
+      filled: true,
+      promptIndex: Number(payload?.promptIndex) || 0
+    };
+  }
+
+  async function validateAutofillRequest(payload) {
+    if (runtimeState.isRunning) {
+      throw new Error("Đang có một luồng automation khác chạy trên Flow.");
+    }
+
+    const prompts = Array.isArray(payload?.prompts) ? payload.prompts.map((item) => String(item || "").trim()).filter(Boolean) : [];
+    if (prompts.length === 0) {
+      throw new Error("Danh sách prompt để chạy tự động đang rỗng.");
+    }
+
+    validatePageContext();
+    await ensureComposerReady();
+
+    if (!findPromptInput()) {
+      throw new Error("Không tìm thấy ô nhập prompt của Flow.");
+    }
+
+    if (!findGenerateButton()) {
+      throw new Error("Không tìm thấy nút Generate trên composer của Flow.");
+    }
+  }
+
+  async function runAutofillSequenceSafely(payload) {
+    try {
+      await runAutofillSequence(payload);
+    } catch (error) {
+      console.error("Flow autofill bị lỗi:", error);
+    } finally {
+      runtimeState.isRunning = false;
+      runtimeState.stopRequested = false;
+    }
+  }
+
+  async function runAutofillSequence(payload) {
+    const prompts = Array.isArray(payload?.prompts) ? payload.prompts.map((item) => String(item || "").trim()).filter(Boolean) : [];
+    const delayMs = Math.max(10000, Number(payload?.delayMs) || 10000);
+    const longPauseEvery = Math.max(1, Number(payload?.longPauseEvery) || 5);
+    const longPauseMs = Math.max(delayMs, Number(payload?.longPauseMs) || 20000);
+
+    for (let index = 0; index < prompts.length; index += 1) {
+      throwIfStopRequested();
+      const prompt = prompts[index];
+
+      await ensureComposerReady();
+      const promptInput = await populatePromptEditor(prompt);
+      if (!promptInput) {
+        throw new Error(`Không thể điền prompt #${index + 1} vào Flow.`);
+      }
+
+      await wait(FLOW_TIMING.interactionDelayMs);
+      await submitPromptOnce();
+      await wait(500);
+      await clearPromptComposerForAutofill();
+
+      if (index >= prompts.length - 1) {
+        continue;
+      }
+
+      const completedCount = index + 1;
+      const pauseMs = completedCount % longPauseEvery === 0 ? longPauseMs : delayMs;
+      await wait(pauseMs);
+    }
+  }
+
+  async function clearPromptComposerForAutofill() {
+    try {
+      await clearPromptComposer();
+      return;
+    } catch (error) {
+      console.warn("Xóa prompt theo nhánh chuẩn bị lỗi, chuyển sang xóa cưỡng bức:", error);
+    }
+
+    const candidates = getPromptCandidates();
+    let touchedAny = false;
+
+    for (const candidate of candidates) {
+      try {
+        const target = resolvePromptEditingTarget(candidate);
+        if (!target) {
+          continue;
+        }
+
+        touchedAny = true;
+        await forceClearPromptTarget(target);
+      } catch (error) {
+        console.warn("Không thể xóa cưỡng bức prompt ở candidate:", candidate, error);
+      }
+    }
+
+    if (!touchedAny) {
+      throw new Error("Không tìm thấy editor hợp lệ để chuẩn bị prompt kế tiếp.");
     }
   }
 
@@ -717,6 +859,16 @@
     }
   }
 
+  async function submitPromptOnce() {
+    await clickGenerateButton();
+    await wait(700);
+
+    const submissionError = detectSubmissionError();
+    if (submissionError) {
+      throw new Error(submissionError);
+    }
+  }
+
   function resolvePromptEditingTarget(candidate) {
     if (!(candidate instanceof HTMLElement)) {
       return null;
@@ -883,6 +1035,10 @@
   function findGenerateButton() {
     const promptInput = findPromptInput();
     const composerRoot = findComposerRoot(promptInput);
+    const exactComposerButton = findExactComposerGenerateButton(promptInput, composerRoot);
+    if (exactComposerButton) {
+      return exactComposerButton;
+    }
     const promptNeighbor = findGenerateButtonNearPrompt(promptInput, composerRoot);
 
     if (promptNeighbor) {
@@ -902,6 +1058,58 @@
     }
 
     return null;
+  }
+
+  function findExactComposerGenerateButton(promptInput, composerRoot) {
+    if (!(promptInput instanceof HTMLElement) || !(composerRoot instanceof HTMLElement)) {
+      return null;
+    }
+
+    const promptRect = promptInput.getBoundingClientRect();
+    const composerRect = composerRoot.getBoundingClientRect();
+    const buttons = Array.from(composerRoot.querySelectorAll("button, [role='button']"))
+      .filter((button) => isVisible(button))
+      .filter((button) => !isDisallowedGenerateCandidate(button))
+      .map((button) => {
+        const rect = button.getBoundingClientRect();
+        const text = normalizeText(getElementText(button));
+        const iconText = normalizeText(button.querySelector("i, .material-icons, [class*='material']")?.textContent || "");
+        let score = 0;
+
+        if (iconText.includes("arrow_forward")) {
+          score += 40;
+        }
+
+        if (text.includes("arrow_forward") || text.includes("tạo") || text.includes("generate") || text.includes("send")) {
+          score += 20;
+        }
+
+        const horizontalGap = Math.abs(rect.left - promptRect.right);
+        const verticalGap = Math.abs((rect.top + rect.height / 2) - (promptRect.top + promptRect.height / 2));
+        score += Math.max(0, 24 - horizontalGap / 6);
+        score += Math.max(0, 18 - verticalGap / 8);
+
+        if (rect.left >= promptRect.right - 20) {
+          score += 12;
+        }
+
+        if (rect.right <= composerRect.right + 4) {
+          score += 8;
+        }
+
+        if (rect.width >= 28 && rect.width <= 72 && rect.height >= 28 && rect.height <= 72) {
+          score += 10;
+        }
+
+        if (rect.bottom > window.innerHeight * 0.72) {
+          score += 10;
+        }
+
+        return { button, score };
+      })
+      .sort((a, b) => b.score - a.score);
+
+    return buttons[0]?.score >= 42 ? buttons[0].button : null;
   }
 
   function findGenerateButtonNearPrompt(promptInput, composerRoot) {
@@ -1162,13 +1370,50 @@
       throw new Error(crashMessage);
     }
 
+    const promptInput = findPromptInput();
     const button = findGenerateButton();
 
     if (!(button instanceof HTMLElement)) {
       throw new Error("Không tìm thấy nút Generate.");
     }
 
+    const composerRoot = findComposerRoot(promptInput);
+    if (composerRoot instanceof HTMLElement && !composerRoot.contains(button)) {
+      throw new Error("Nút Generate tìm thấy không nằm trong composer hiện tại.");
+    }
+
+    await clickGenerateActionButton(button);
+    await wait(FLOW_TIMING.interactionDelayMs);
+  }
+
+  async function clickGenerateActionButton(button) {
+    if (!(button instanceof HTMLElement)) {
+      throw new Error("Nút Generate không hợp lệ.");
+    }
+
+    button.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    const rect = button.getBoundingClientRect();
+    const clientX = rect.left + rect.width / 2;
+    const clientY = rect.top + rect.height / 2;
+    const topElement = document.elementFromPoint(clientX, clientY);
+    if (topElement instanceof Element && !button.contains(topElement) && !topElement.contains(button)) {
+      throw new Error("Tọa độ tâm của nút Generate hiện không trỏ đúng vào nút. Dừng để tránh click nhầm.");
+    }
+
+    button.focus?.();
+
+    const response = await runtimeSendMessage({
+      type: "FLOW_DEBUGGER_CLICK_AT",
+      payload: { x: clientX, y: clientY }
+    });
+
+    if (response?.ok) {
+      await wait(320);
+      return;
+    }
+
     button.click();
+    await wait(320);
   }
 
   async function ensureSettingsPanelOpen() {
@@ -1572,6 +1817,7 @@
 
   async function clearPromptComposer() {
     const candidates = getPromptCandidates();
+    let clearedAny = false;
 
     for (const candidate of candidates) {
       try {
@@ -1580,17 +1826,80 @@
           continue;
         }
 
-        await typePromptWithDebugger(target, "");
-        await wait(120);
-
-        const currentValue = normalizeText(readPromptValue(target));
-        if (!currentValue || currentValue === "bạn muốn tạo gì?" || currentValue.includes("mô tả ý tưởng của bạn")) {
-          return;
+        clearedAny = true;
+        const cleared = await clearPromptTarget(target);
+        if (cleared) {
+          await wait(80);
         }
       } catch (error) {
         console.warn("Không xóa được prompt hiện tại:", candidate, error);
       }
     }
+
+    if (!clearedAny) {
+      throw new Error("Không tìm thấy editor hợp lệ để xóa prompt hiện tại.");
+    }
+
+    if (!isComposerPromptCleared()) {
+      throw new Error("Không thể xóa sạch prompt hiện tại khỏi composer của Flow.");
+    }
+  }
+
+  async function clearPromptTarget(target) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await typePromptWithDebugger(target, "");
+      await wait(180);
+
+      const currentValue = normalizeText(readPromptValue(target));
+      if (isPromptEffectivelyEmpty(currentValue)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  async function forceClearPromptTarget(target) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await typePromptWithDebugger(target, "");
+      dispatchPromptEvents(target, "");
+      await wait(220);
+
+      const currentValue = normalizeText(readPromptValue(target));
+      if (isPromptEffectivelyEmpty(currentValue)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  function isComposerPromptCleared() {
+    const candidates = getPromptCandidates();
+    for (const candidate of candidates) {
+      try {
+        const target = resolvePromptEditingTarget(candidate);
+        if (!target) {
+          continue;
+        }
+
+        const currentValue = normalizeText(readPromptValue(target));
+        if (!isPromptEffectivelyEmpty(currentValue)) {
+          return false;
+        }
+      } catch (error) {
+        console.warn("Không kiểm tra được trạng thái prompt sau khi xóa:", candidate, error);
+      }
+    }
+
+    return true;
+  }
+
+  function isPromptEffectivelyEmpty(currentValue) {
+    return !currentValue
+      || currentValue === "bạn muốn tạo gì?"
+      || currentValue.includes("mô tả ý tưởng của bạn")
+      || currentValue.includes("what do you want");
   }
 
   function collectResultImages() {

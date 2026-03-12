@@ -5,7 +5,9 @@ const STORAGE_KEYS = {
 
 const DEFAULT_CONFIG = {
   rawPrompts: "",
-  galleryFilter: ""
+  galleryFilter: "",
+  selectedPromptIndex: -1,
+  lastFilledPromptIndex: -1
 };
 
 let ui = {};
@@ -38,6 +40,11 @@ document.addEventListener("DOMContentLoaded", async () => {
     galleryFilterInput: document.getElementById("galleryFilterInput"),
     promptPreviewCount: document.getElementById("promptPreviewCount"),
     promptPreviewContainer: document.getElementById("promptPreviewContainer"),
+    fillSelectedPromptButton: document.getElementById("fillSelectedPromptButton"),
+    fillNextPromptButton: document.getElementById("fillNextPromptButton"),
+    runAllPromptsButton: document.getElementById("runAllPromptsButton"),
+    stopPromptRunButton: document.getElementById("stopPromptRunButton"),
+    resetAllButton: document.getElementById("resetAllButton"),
     scannedCountValue: document.getElementById("scannedCountValue"),
     selectedCountValue: document.getElementById("selectedCountValue"),
     messageBox: document.getElementById("messageBox"),
@@ -50,6 +57,11 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   ui.promptsInput.addEventListener("input", handlePromptsChanged);
   ui.galleryFilterInput.addEventListener("input", handleGalleryFilterChanged);
+  ui.fillSelectedPromptButton.addEventListener("click", handleFillSelectedPrompt);
+  ui.fillNextPromptButton.addEventListener("click", handleFillNextPrompt);
+  ui.runAllPromptsButton.addEventListener("click", handleRunAllPrompts);
+  ui.stopPromptRunButton.addEventListener("click", handleStopPromptRun);
+  ui.resetAllButton.addEventListener("click", handleResetAll);
   ui.scanSessionButton.addEventListener("click", handleScanSessionImages);
   ui.downloadFromFlowButton.addEventListener("click", handleDownloadFromFlow);
   ui.clearGalleryButton.addEventListener("click", handleClearGallery);
@@ -90,7 +102,9 @@ async function hydrateFromStorage() {
 function normalizeConfig(config) {
   return {
     rawPrompts: String(config?.rawPrompts || ""),
-    galleryFilter: String(config?.galleryFilter || "")
+    galleryFilter: String(config?.galleryFilter || ""),
+    selectedPromptIndex: Number.isFinite(Number(config?.selectedPromptIndex)) ? Number(config.selectedPromptIndex) : -1,
+    lastFilledPromptIndex: Number.isFinite(Number(config?.lastFilledPromptIndex)) ? Number(config.lastFilledPromptIndex) : -1
   };
 }
 
@@ -101,6 +115,8 @@ function applyConfigToForm(config) {
 
 function handlePromptsChanged() {
   cache.config.rawPrompts = ui.promptsInput.value;
+  cache.config.selectedPromptIndex = -1;
+  cache.config.lastFilledPromptIndex = -1;
   persistConfigDebounced();
   renderPromptPreview();
   renderGallery();
@@ -139,6 +155,122 @@ async function handleScanSessionImages() {
   } catch (error) {
     setMessage(error.message || "Không thể quét ảnh từ session Flow hiện tại.", "error");
   }
+}
+
+async function handleFillSelectedPrompt() {
+  try {
+    const entries = getPromptEntriesSafe();
+    if (entries.length === 0) {
+      throw new Error("Chưa có prompt hợp lệ để điền vào Flow.");
+    }
+
+    if (!hasSelectedPrompt(entries.length)) {
+      throw new Error("Hãy chọn một prompt trong danh sách trước khi điền.");
+    }
+
+    const targetIndex = clampPromptIndex(cache.config.selectedPromptIndex, entries.length);
+    const targetEntry = entries[targetIndex];
+    await fillPromptToFlow(targetEntry, entries.length);
+    cache.config.selectedPromptIndex = targetIndex;
+    cache.config.lastFilledPromptIndex = targetIndex;
+    await storageSet({ [STORAGE_KEYS.config]: cache.config });
+    renderPromptPreview();
+  } catch (error) {
+    setMessage(error.message || "Không thể điền prompt đã chọn vào Flow.", "error");
+  }
+}
+
+async function handleFillNextPrompt() {
+  try {
+    const entries = getPromptEntriesSafe();
+    if (entries.length === 0) {
+      throw new Error("Chưa có prompt hợp lệ để điền vào Flow.");
+    }
+
+    const nextIndex = resolveNextPromptIndex(entries.length);
+    const targetEntry = entries[nextIndex];
+    await fillPromptToFlow(targetEntry, entries.length);
+    cache.config.selectedPromptIndex = nextIndex;
+    cache.config.lastFilledPromptIndex = nextIndex;
+    await storageSet({ [STORAGE_KEYS.config]: cache.config });
+    renderPromptPreview();
+  } catch (error) {
+    setMessage(error.message || "Không thể điền prompt kế tiếp vào Flow.", "error");
+  }
+}
+
+async function handleRunAllPrompts() {
+  try {
+    const entries = getPromptEntriesSafe();
+    if (entries.length === 0) {
+      throw new Error("Chưa có prompt hợp lệ để chạy tự động.");
+    }
+
+    const tab = await getActiveTab();
+    assertTabIsScriptable(tab);
+    await ensureContentScript(tab.id);
+
+    const startIndex = hasSelectedPrompt(entries.length)
+      ? clampPromptIndex(cache.config.selectedPromptIndex, entries.length)
+      : 0;
+    const prompts = entries.slice(startIndex).map((entry) => entry.prompt);
+    if (prompts.length === 0) {
+      throw new Error("Không còn prompt nào để chạy từ vị trí hiện tại.");
+    }
+
+      const response = await tabsSendMessage(tab.id, {
+        type: "FLOW_AUTOFILL_PROMPTS",
+        payload: {
+          prompts,
+          startIndex,
+          delayMs: 10000,
+          longPauseEvery: 5,
+          longPauseMs: 20000
+        }
+      });
+
+    if (!response?.ok) {
+      throw new Error(response?.error || "Flow không nhận lệnh chạy tự động prompt.");
+    }
+
+      cache.config.lastFilledPromptIndex = startIndex - 1;
+      await storageSet({ [STORAGE_KEYS.config]: cache.config });
+      setMessage(`Đã bắt đầu chạy ${prompts.length} prompt. Mỗi prompt nghỉ 10 giây, cứ 5 prompt nghỉ 20 giây.`, "success");
+    } catch (error) {
+      setMessage(error.message || "Không thể chạy tự động toàn bộ prompt.", "error");
+    }
+  }
+
+async function handleStopPromptRun() {
+  try {
+    const tab = await getActiveTab();
+    assertTabIsScriptable(tab);
+    await ensureContentScript(tab.id);
+
+    const response = await tabsSendMessage(tab.id, {
+      type: "FLOW_AUTOFILL_STOP"
+    });
+
+    if (!response?.ok) {
+      throw new Error(response?.error || "Flow không nhận lệnh dừng chạy prompt.");
+    }
+
+    setMessage("Đã gửi lệnh dừng chạy prompt.", "success");
+  } catch (error) {
+    setMessage(error.message || "Không thể dừng chạy prompt.", "error");
+  }
+}
+
+async function handleResetAll() {
+  cache.config = { ...DEFAULT_CONFIG };
+  cache.results = [];
+  applyConfigToForm(cache.config);
+  await storageSet({
+    [STORAGE_KEYS.config]: cache.config,
+    [STORAGE_KEYS.results]: []
+  });
+  renderAll();
+  setMessage("Đã reset toàn bộ prompt, bộ lọc, gallery và trạng thái chọn.", "success");
 }
 
 async function handleDownloadFromFlow() {
@@ -262,6 +394,16 @@ function renderPromptPreview() {
   for (const entry of visibleEntries) {
     const item = document.createElement("div");
     item.className = "prompt-preview-item";
+    if (entry.index === cache.config.selectedPromptIndex) {
+      item.classList.add("selected");
+    }
+    item.dataset.promptIndex = String(entry.index);
+    item.addEventListener("click", () => {
+      cache.config.selectedPromptIndex = cache.config.selectedPromptIndex === entry.index ? -1 : entry.index;
+      void storageSet({ [STORAGE_KEYS.config]: cache.config });
+      renderPromptPreview();
+      syncActionState();
+    });
 
     const header = document.createElement("div");
     header.className = "prompt-preview-item-header";
@@ -351,6 +493,77 @@ function syncActionState() {
   const selectedCount = cache.results.filter((item) => item.selected).length;
   ui.downloadFromFlowButton.disabled = selectedCount === 0;
   ui.clearGalleryButton.disabled = cache.results.length === 0;
+
+  const entries = getPromptEntriesSafe();
+  const hasPrompts = entries.length > 0;
+  ui.fillSelectedPromptButton.disabled = !hasPrompts || !hasSelectedPrompt(entries.length);
+  ui.fillNextPromptButton.disabled = !hasPrompts;
+  ui.runAllPromptsButton.disabled = !hasPrompts;
+  ui.stopPromptRunButton.disabled = false;
+  ui.resetAllButton.disabled = !cache.config.rawPrompts.trim() && !cache.config.galleryFilter.trim() && cache.results.length === 0;
+}
+
+function getPromptEntriesSafe() {
+  const rawValue = String(cache.config.rawPrompts || "");
+  if (!rawValue.trim()) {
+    return [];
+  }
+
+  try {
+    return parsePromptEntries(rawValue);
+  } catch (error) {
+    return [];
+  }
+}
+
+function clampPromptIndex(index, total) {
+  if (!Number.isFinite(Number(index))) {
+    return 0;
+  }
+
+  const normalized = Number(index);
+  return Math.max(0, Math.min(total - 1, normalized));
+}
+
+function hasSelectedPrompt(totalPrompts) {
+  const selectedIndex = Number(cache.config.selectedPromptIndex);
+  return Number.isFinite(selectedIndex) && selectedIndex >= 0 && selectedIndex < totalPrompts;
+}
+
+function resolveNextPromptIndex(totalPrompts) {
+  const last = Number(cache.config.lastFilledPromptIndex);
+  if (!Number.isFinite(last) || last < 0) {
+    return clampPromptIndex(cache.config.selectedPromptIndex, totalPrompts);
+  }
+
+  if (last >= totalPrompts - 1) {
+    return 0;
+  }
+
+  return last + 1;
+}
+
+async function fillPromptToFlow(entry, totalPrompts) {
+  const tab = await getActiveTab();
+  assertTabIsScriptable(tab);
+  await ensureContentScript(tab.id);
+
+  const response = await tabsSendMessage(tab.id, {
+    type: "FLOW_FILL_PROMPT",
+    payload: {
+      prompt: entry.prompt,
+      promptIndex: entry.index
+    }
+  });
+
+  if (!response?.ok) {
+    throw new Error(response?.error || "Flow không xác nhận thao tác điền prompt.");
+  }
+
+  setMessage(
+    `Đã điền prompt ${entry.index + 1}/${totalPrompts} vào ô nhập của Flow.`,
+    "success"
+  );
 }
 
 function setMessage(message, tone = "default") {

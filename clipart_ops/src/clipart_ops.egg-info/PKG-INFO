@@ -1,0 +1,46 @@
+Metadata-Version: 2.4
+Name: clipart-ops
+Version: 0.1.0
+Summary: Ứng dụng desktop Python quản lý bundle clipart Etsy, Google Drive và Pinterest.
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+Requires-Dist: PySide6>=6.8.0
+Requires-Dist: pydantic>=2.10.0
+Requires-Dist: httpx>=0.28.0
+Requires-Dist: markdown>=3.7
+Requires-Dist: watchdog>=6.0.0
+Requires-Dist: google-api-python-client>=2.164.0
+Requires-Dist: google-auth-httplib2>=0.2.0
+Requires-Dist: google-auth-oauthlib>=1.2.1
+Provides-Extra: dev
+Requires-Dist: pytest>=8.3.0; extra == "dev"
+
+# Clipart Ops
+
+Ứng dụng desktop Python + PySide6 để vận hành workspace clipart:
+- quản lý cây thư mục chủ đề
+- đóng gói bundle Etsy
+- sinh metadata Etsy/Pinterest
+- xem và sửa CSV Pinterest, Markdown, JSON
+- upload ảnh marketing lên Google Drive
+- tạo CSV Pinterest theo hướng CSV-first
+
+## Chạy local
+
+```bash
+cd clipart_ops
+python -m venv .venv
+.venv\Scripts\activate
+pip install -e .[dev]
+python -m clipart_ops.main
+```
+
+## Secrets cần có
+
+- `GOOGLE_AI_API_KEY`: dùng cho sinh metadata AI
+- `GOOGLE_DRIVE_CLIENT_SECRET`: đường dẫn tới file OAuth Desktop Client JSON của Google Drive
+
+## Lưu ý
+
+- Nếu thiếu `GOOGLE_AI_API_KEY`, app sẽ dùng chế độ sinh metadata mẫu để bạn vẫn thao tác được.
+- Nếu thiếu thư viện hoặc secret Google Drive, app vẫn chạy được nhưng action upload Drive sẽ báo rõ điều kiện còn thiếu.

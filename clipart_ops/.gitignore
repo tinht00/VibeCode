@@ -1,0 +1,5 @@
+.venv/
+.smoke_state/
+.clipart_ops_state/
+__pycache__/
+*.pyc
