@@ -1,0 +1,6 @@
+fastapi>=0.116,<1.0
+uvicorn[standard]>=0.35,<1.0
+RealtimeTTS>=0.6.19
+edge-tts>=7.2.8
+audioop-lts>=0.2.2
+

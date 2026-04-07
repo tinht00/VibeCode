@@ -1,0 +1,37 @@
+INFO:     Started server process [32848]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8010 (Press CTRL+C to quit)
+INFO:     127.0.0.1:62960 - "WebSocket /sessions/36a197187b4c47e99c88f6728edc410a/stream" [accepted]
+INFO:     connection open
+INFO:     connection closed
+INFO:     127.0.0.1:58766 - "WebSocket /sessions/bb85a9cf23f6471992f337accbff8f6b/stream" [accepted]
+INFO:     connection open
+INFO:     connection closed
+INFO:     127.0.0.1:55464 - "WebSocket /sessions/502ac74d765b4714aaa6202eef86708a/stream" [accepted]
+INFO:     connection open
+INFO:     connection closed
+INFO:     127.0.0.1:57019 - "WebSocket /sessions/da7fd23486c54636bab837186b247f0f/stream" [accepted]
+INFO:     connection open
+INFO:     connection closed
+INFO:     127.0.0.1:50276 - "WebSocket /sessions/8d08da7813864fec8261a12c9aaa63dd/stream" [accepted]
+INFO:     connection open
+INFO:     connection closed
+INFO:     127.0.0.1:53627 - "WebSocket /sessions/ac6b6559f73c46e28b9519a7712e4c79/stream" [accepted]
+INFO:     connection open
+INFO:     connection closed
+INFO:     127.0.0.1:54582 - "WebSocket /sessions/d56639c584b94299bea544d8b6f8634f/stream" [accepted]
+INFO:     connection open
+INFO:     connection closed
+INFO:     127.0.0.1:55251 - "WebSocket /sessions/2bb98ca9ae93483dabcb1337700dfc84/stream" [accepted]
+INFO:     connection open
+INFO:     connection closed
+INFO:     127.0.0.1:53252 - "WebSocket /sessions/4ab3f0dfc1aa4eeb98b77aaef0fb6c21/stream" [accepted]
+INFO:     connection open
+INFO:     connection closed
+INFO:     127.0.0.1:54830 - "WebSocket /sessions/74972e014ea4419aa978d24f227c7874/stream" [accepted]
+INFO:     connection open
+INFO:     connection closed
+INFO:     127.0.0.1:55172 - "WebSocket /sessions/ee33a9a655c34df485465d3071a488bd/stream" [accepted]
+INFO:     connection open
+INFO:     connection closed

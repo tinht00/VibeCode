@@ -1,0 +1,129 @@
+[GIN-debug] [WARNING] Creating an Engine instance with the Logger and Recovery middleware already attached.
+
+[GIN-debug] [WARNING] Running in "debug" mode. Switch to "release" mode in production.
+ - using env:	export GIN_MODE=release
+ - using code:	gin.SetMode(gin.ReleaseMode)
+
+[GIN-debug] GET    /health                   --> story-tts/backend/internal/api.(*Server).health-fm (3 handlers)
+[GIN-debug] GET    /library/*filepath        --> github.com/gin-gonic/gin.(*RouterGroup).createStaticHandler.func1 (3 handlers)
+[GIN-debug] HEAD   /library/*filepath        --> github.com/gin-gonic/gin.(*RouterGroup).createStaticHandler.func1 (3 handlers)
+[GIN-debug] GET    /api/state                --> story-tts/backend/internal/api.(*Server).getState-fm (3 handlers)
+[GIN-debug] GET    /api/stories              --> story-tts/backend/internal/api.(*Server).listStories-fm (3 handlers)
+[GIN-debug] GET    /api/library/stories      --> story-tts/backend/internal/api.(*Server).listStories-fm (3 handlers)
+[GIN-debug] GET    /api/library/stories/:id  --> story-tts/backend/internal/api.(*Server).getStory-fm (3 handlers)
+[GIN-debug] POST   /api/library/import-folder --> story-tts/backend/internal/api.(*Server).importFolder-fm (3 handlers)
+[GIN-debug] GET    /api/library/chapters/:id/content --> story-tts/backend/internal/api.(*Server).getChapterContent-fm (3 handlers)
+[GIN-debug] GET    /api/reader/progress/:storyId --> story-tts/backend/internal/api.(*Server).getReaderProgress-fm (3 handlers)
+[GIN-debug] POST   /api/reader/progress      --> story-tts/backend/internal/api.(*Server).saveReaderProgress-fm (3 handlers)
+[GIN-debug] POST   /api/reader/chapters/:id/speak --> story-tts/backend/internal/api.(*Server).speakChapterDirect-fm (3 handlers)
+[GIN-debug] GET    /api/reader/sessions/:id  --> story-tts/backend/internal/api.(*Server).getDirectTTSSession-fm (3 handlers)
+[GIN-debug] POST   /api/stories/scan         --> story-tts/backend/internal/api.(*Server).scanStory-fm (3 handlers)
+[GIN-debug] GET    /api/stories/:id          --> story-tts/backend/internal/api.(*Server).getStory-fm (3 handlers)
+[GIN-debug] POST   /api/stories/:id/build    --> story-tts/backend/internal/api.(*Server).buildStory-fm (3 handlers)
+[GIN-debug] POST   /api/chapters/:id/build   --> story-tts/backend/internal/api.(*Server).buildChapter-fm (3 handlers)
+[GIN-debug] GET    /api/jobs                 --> story-tts/backend/internal/api.(*Server).listJobs-fm (3 handlers)
+[GIN-debug] GET    /api/jobs/:id             --> story-tts/backend/internal/api.(*Server).getJob-fm (3 handlers)
+[GIN-debug] GET    /api/bot-profiles         --> story-tts/backend/internal/api.(*Server).listBotProfiles-fm (3 handlers)
+[GIN-debug] POST   /api/bot-profiles         --> story-tts/backend/internal/api.(*Server).saveBotProfile-fm (3 handlers)
+[GIN-debug] POST   /api/telegram/send-code   --> story-tts/backend/internal/api.(*Server).sendTelegramCode-fm (3 handlers)
+[GIN-debug] POST   /api/telegram/sign-in     --> story-tts/backend/internal/api.(*Server).signInTelegram-fm (3 handlers)
+[GIN-debug] POST   /api/telegram/password    --> story-tts/backend/internal/api.(*Server).telegramPassword-fm (3 handlers)
+[GIN-debug] GET    /api/telegram/qr          --> story-tts/backend/internal/api.(*Server).getTelegramQR-fm (3 handlers)
+[GIN-debug] POST   /api/telegram/qr/start    --> story-tts/backend/internal/api.(*Server).startTelegramQR-fm (3 handlers)
+[GIN-debug] POST   /api/telegram/qr/cancel   --> story-tts/backend/internal/api.(*Server).cancelTelegramQR-fm (3 handlers)
+[GIN] 2026/04/07 - 11:51:18 | 200 |       0s |       127.0.0.1 | GET      "/api/state"
+[GIN] 2026/04/07 - 12:38:02 | 200 |  13.63ms |       127.0.0.1 | GET      "/api/reader/progress/3"
+[GIN] 2026/04/07 - 12:38:03 | 200 | 410.81ms |       127.0.0.1 | GET      "/api/library/stories/3"
+[GIN] 2026/04/07 - 12:38:03 | 200 |   1.38ms |       127.0.0.1 | GET      "/api/library/chapters/13/content"
+[GIN] 2026/04/07 - 12:38:03 | 200 | 166.67ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 12:38:05 | 200 |  48.93ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 12:39:24 | 200 |   3.01ms |       127.0.0.1 | GET      "/api/library/stories"
+[GIN] 2026/04/07 - 12:39:24 | 200 |   3.01ms |       127.0.0.1 | GET      "/api/state"
+[GIN] 2026/04/07 - 12:39:24 | 200 |  776.7µs |       127.0.0.1 | GET      "/api/reader/progress/3"
+[GIN] 2026/04/07 - 12:39:24 | 200 |   2.46ms |       127.0.0.1 | GET      "/api/library/stories/3"
+[GIN] 2026/04/07 - 12:39:24 | 200 |   1.01ms |       127.0.0.1 | GET      "/api/library/chapters/13/content"
+[GIN] 2026/04/07 - 12:39:24 | 200 |  61.63ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 12:39:25 | 200 |       0s |       127.0.0.1 | GET      "/api/library/stories"
+[GIN] 2026/04/07 - 12:39:25 | 200 |       0s |       127.0.0.1 | GET      "/api/state"
+[GIN] 2026/04/07 - 12:40:06 | 200 |   1.02ms |       127.0.0.1 | GET      "/api/library/chapters/14/content"
+[GIN] 2026/04/07 - 12:40:06 | 200 |   1.54ms |       127.0.0.1 | GET      "/api/library/stories/4"
+[GIN] 2026/04/07 - 12:40:24 | 200 |      1ms |       127.0.0.1 | GET      "/api/library/chapters/14/content"
+[GIN] 2026/04/07 - 12:40:24 | 200 |  506.7µs |       127.0.0.1 | GET      "/api/library/chapters/15/content"
+[GIN] 2026/04/07 - 12:45:01 | 200 | 352.88ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 12:45:02 | 200 |  51.15ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 12:45:02 | 200 |  61.56ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 12:45:12 | 200 |  60.78ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 12:45:17 | 200 |  52.71ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 12:45:23 | 200 |  53.86ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 12:45:29 | 200 |  55.19ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 12:45:41 | 200 |       0s |       127.0.0.1 | GET      "/api/state"
+[GIN] 2026/04/07 - 12:45:41 | 200 |    506µs |       127.0.0.1 | GET      "/api/library/stories"
+[GIN] 2026/04/07 - 12:45:42 | 200 |   23.1ms |       127.0.0.1 | GET      "/api/reader/progress/3"
+[GIN] 2026/04/07 - 12:45:42 | 200 |  56.21ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 12:45:42 | 200 |   24.6ms |       127.0.0.1 | GET      "/api/library/stories/3"
+[GIN] 2026/04/07 - 12:45:42 | 200 |   1.01ms |       127.0.0.1 | GET      "/api/library/chapters/13/content"
+[GIN] 2026/04/07 - 12:45:42 | 200 |  64.35ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 12:48:49 | 200 |       0s |       127.0.0.1 | GET      "/api/state"
+[GIN] 2026/04/07 - 12:48:49 | 200 |  514.2µs |       127.0.0.1 | GET      "/api/library/stories"
+[GIN] 2026/04/07 - 12:48:50 | 200 |  544.4µs |       127.0.0.1 | GET      "/api/library/stories/3"
+[GIN] 2026/04/07 - 12:48:50 | 200 |  559.9µs |       127.0.0.1 | GET      "/api/reader/progress/3"
+[GIN] 2026/04/07 - 12:48:50 | 200 |  502.7µs |       127.0.0.1 | GET      "/api/library/chapters/13/content"
+[GIN] 2026/04/07 - 12:48:51 | 200 |   53.5ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 12:49:02 | 200 | 180.09ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 12:49:02 | 200 |  45.46ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 12:49:02 | 200 |  65.48ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 12:49:10 | 200 |  46.11ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 12:49:18 | 200 |       0s |       127.0.0.1 | GET      "/api/state"
+[GIN] 2026/04/07 - 12:49:18 | 200 |  60.23ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 12:49:18 | 200 |       0s |       127.0.0.1 | GET      "/api/library/stories"
+[GIN] 2026/04/07 - 12:49:18 | 200 |  64.55ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 12:49:19 | 200 |    803µs |       127.0.0.1 | GET      "/api/reader/progress/3"
+[GIN] 2026/04/07 - 12:49:19 | 200 |   2.41ms |       127.0.0.1 | GET      "/api/library/stories/3"
+[GIN] 2026/04/07 - 12:49:19 | 200 |    1.5ms |       127.0.0.1 | GET      "/api/library/chapters/13/content"
+[GIN] 2026/04/07 - 12:49:19 | 200 |  51.97ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 12:51:30 | 200 |  514.5µs |       127.0.0.1 | GET      "/api/state"
+[GIN] 2026/04/07 - 12:51:30 | 200 | 111.76ms |       127.0.0.1 | GET      "/api/library/stories"
+[GIN] 2026/04/07 - 12:51:30 | 200 | 342.18ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 12:51:30 | 200 |  596.5µs |       127.0.0.1 | GET      "/api/library/stories/3"
+[GIN] 2026/04/07 - 12:51:31 | 200 |       0s |       127.0.0.1 | GET      "/api/reader/progress/3"
+[GIN] 2026/04/07 - 12:51:31 | 200 |       0s |       127.0.0.1 | GET      "/api/library/chapters/13/content"
+[GIN] 2026/04/07 - 12:51:31 | 200 |  57.67ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 12:57:59 | 200 |  49.82ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 12:59:00 | 200 |  48.98ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 12:59:32 | 200 |  62.33ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 12:59:32 | 200 |  60.59ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 12:59:56 | 200 |  67.44ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 12:59:56 | 200 |       0s |       127.0.0.1 | GET      "/api/state"
+[GIN] 2026/04/07 - 12:59:56 | 200 |  505.8µs |       127.0.0.1 | GET      "/api/library/stories"
+[GIN] 2026/04/07 - 12:59:56 | 200 |    784µs |       127.0.0.1 | GET      "/api/library/stories/3"
+[GIN] 2026/04/07 - 12:59:57 | 200 |       0s |       127.0.0.1 | GET      "/api/reader/progress/3"
+[GIN] 2026/04/07 - 12:59:57 | 200 |  504.4µs |       127.0.0.1 | GET      "/api/library/chapters/13/content"
+[GIN] 2026/04/07 - 12:59:57 | 200 |  57.64ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 13:00:03 | 200 |  64.13ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 13:00:04 | 200 |  52.49ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 13:00:05 | 200 |     55ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 13:00:07 | 200 |  42.82ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 13:00:07 | 200 |  43.73ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 13:00:14 | 200 |   63.3ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 13:00:14 | 200 |       0s |       127.0.0.1 | GET      "/api/state"
+[GIN] 2026/04/07 - 13:00:14 | 200 |  505.9µs |       127.0.0.1 | GET      "/api/library/stories"
+[GIN] 2026/04/07 - 13:00:15 | 200 |  513.9µs |       127.0.0.1 | GET      "/api/library/stories/3"
+[GIN] 2026/04/07 - 13:00:15 | 200 |  505.1µs |       127.0.0.1 | GET      "/api/reader/progress/3"
+[GIN] 2026/04/07 - 13:00:15 | 200 |   1.06ms |       127.0.0.1 | GET      "/api/library/chapters/13/content"
+[GIN] 2026/04/07 - 13:00:16 | 200 |  43.97ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 13:00:50 | 200 |  57.75ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 13:00:50 | 200 |       0s |       127.0.0.1 | GET      "/api/state"
+[GIN] 2026/04/07 - 13:00:50 | 200 |       0s |       127.0.0.1 | GET      "/api/library/stories"
+[GIN] 2026/04/07 - 13:00:50 | 200 |   2.17ms |       127.0.0.1 | GET      "/api/library/stories/3"
+[GIN] 2026/04/07 - 13:00:51 | 200 |   2.59ms |       127.0.0.1 | GET      "/api/reader/progress/3"
+[GIN] 2026/04/07 - 13:00:51 | 200 |   1.83ms |       127.0.0.1 | GET      "/api/library/chapters/13/content"
+[GIN] 2026/04/07 - 13:00:51 | 200 |  46.66ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 13:24:28 | 200 |       0s |       127.0.0.1 | GET      "/api/state"
+[GIN] 2026/04/07 - 13:24:28 | 200 |  506.5µs |       127.0.0.1 | GET      "/api/library/stories"
+[GIN] 2026/04/07 - 13:24:28 | 200 |       0s |       127.0.0.1 | GET      "/api/reader/progress/3"
+[GIN] 2026/04/07 - 13:24:29 | 200 |       0s |       127.0.0.1 | GET      "/api/reader/progress/4"
+[GIN] 2026/04/07 - 13:24:29 | 200 |  714.3µs |       127.0.0.1 | GET      "/api/reader/progress/3"
+[GIN] 2026/04/07 - 13:24:29 | 200 |   2.29ms |       127.0.0.1 | GET      "/api/library/stories/3"
+[GIN] 2026/04/07 - 13:24:29 | 200 |  508.4µs |       127.0.0.1 | GET      "/api/library/chapters/13/content"
+[GIN] 2026/04/07 - 13:24:29 | 200 | 105.91ms |       127.0.0.1 | POST     "/api/reader/progress"
+[GIN] 2026/04/07 - 13:24:47 | 200 |       0s |       127.0.0.1 | GET      "/api/state"

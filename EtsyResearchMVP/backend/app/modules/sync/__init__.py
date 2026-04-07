@@ -1,0 +1,1 @@
+"""Logic đồng bộ Etsy."""

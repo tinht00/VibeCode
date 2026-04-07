@@ -314,9 +314,9 @@
 
   async function runAutofillSequence(payload) {
     const prompts = Array.isArray(payload?.prompts) ? payload.prompts.map((item) => String(item || "").trim()).filter(Boolean) : [];
-    const delayMs = Math.max(10000, Number(payload?.delayMs) || 10000);
+    const delayMs = Math.max(15000, Number(payload?.delayMs) || 15000);
     const longPauseEvery = Math.max(1, Number(payload?.longPauseEvery) || 5);
-    const longPauseMs = Math.max(delayMs, Number(payload?.longPauseMs) || 20000);
+    const longPauseMs = Math.max(delayMs, Number(payload?.longPauseMs) || 25000);
 
     for (let index = 0; index < prompts.length; index += 1) {
       throwIfStopRequested();
