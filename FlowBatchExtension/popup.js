@@ -223,7 +223,7 @@ async function handleRunAllPrompts() {
         payload: {
           prompts,
           startIndex,
-          delayMs: 10000,
+          delayMs: 25000,
           longPauseEvery: 5,
           longPauseMs: 20000
         }
@@ -235,7 +235,7 @@ async function handleRunAllPrompts() {
 
       cache.config.lastFilledPromptIndex = startIndex - 1;
       await storageSet({ [STORAGE_KEYS.config]: cache.config });
-      setMessage(`Đã bắt đầu chạy ${prompts.length} prompt. Mỗi prompt nghỉ 10 giây, cứ 5 prompt nghỉ 20 giây.`, "success");
+      setMessage(`Đã bắt đầu chạy ${prompts.length} prompt. Mỗi prompt nghỉ 25 giây.`, "success");
     } catch (error) {
       setMessage(error.message || "Không thể chạy tự động toàn bộ prompt.", "error");
     }
