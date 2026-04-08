@@ -1,13 +1,14 @@
 # FlowBatch Extension
 
 ## Nhịp chạy prompt tự động
-- Mặc định mỗi prompt nghỉ `25 giây`.
-- Mốc nghỉ theo cụm `5 prompt` vẫn giữ cấu hình `20 giây`, nhưng runtime áp dụng `Math.max(delayMs, longPauseMs)` nên nhịp thực tế vẫn `25 giây/prompt`.
+- Mặc định mỗi prompt nghỉ `15 giây`.
+- Cứ mỗi `5 prompt` sẽ nghỉ dài `25 giây`.
+- Runtime áp dụng `Math.max(delayMs, longPauseMs)` để bảo đảm mốc nghỉ dài không bao giờ ngắn hơn nhịp mặc định.
 - Logic áp dụng trong luồng `FLOW_AUTOFILL_PROMPTS`.
 
 ## Ghi chú debug nhanh
-### Case 1: Thấy extension vẫn chạy nhịp cũ (10 giây)
-- Dấu hiệu nhận biết: popup hiển thị nhịp cũ hoặc log chạy nhanh hơn 25 giây mỗi vòng.
+### Case 1: Thấy extension vẫn chạy nhịp cũ
+- Dấu hiệu nhận biết: popup hiển thị nhịp cũ hoặc log chạy không đúng pattern `15 giây/prompt`, `25 giây` sau mỗi cụm `5 prompt`.
 - Nguyên nhân: Chrome chưa nạp bản extension mới sau khi sửa mã.
 - Cách khắc phục:
   1. Vào `chrome://extensions`.
