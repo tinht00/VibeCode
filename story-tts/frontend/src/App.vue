@@ -61,6 +61,7 @@ const handleStoreName = 'directory-handles'
 const handleKey = 'library-root'
 const realtimePrefsKey = 'story-tts.realtime.controls.v1'
 const edgeReadAloudPrefsKey = 'story-tts.edge-read-aloud.v1'
+const readerPrefsKey = 'story-tts.reader.preferences.v1'
 
 const loading = ref(false)
 const error = ref('')
@@ -94,6 +95,7 @@ const currentStreamMime = ref('audio/mpeg')
 
 const folderInput = ref<HTMLInputElement | null>(null)
 const readerBody = ref<HTMLElement | null>(null)
+const readerScanContent = ref<HTMLElement | null>(null)
 const audioRef = ref<HTMLAudioElement | null>(null)
 
 const contentCache = new Map<number, ChapterContent>()
@@ -113,6 +115,7 @@ const activeTab = ref<'library' | 'reader'>('library')
 const activeReadingBlockIndex = ref(-1)
 const audioCurrentTime = ref(0)
 const audioDuration = ref(0)
+const readerFontSize = ref(18)
 
 const selectedChapter = computed<Chapter | null>(() => {
   if (!selectedStory.value || selectedChapterId.value === null) return null
@@ -391,6 +394,27 @@ function persistRealtimePreferences() {
   } catch {
     // Bỏ qua lỗi localStorage (quota/private mode), không chặn luồng đọc.
   }
+}
+
+function clampReaderFontSize(value: number) {
+  return Math.min(28, Math.max(14, Math.round(value || 18)))
+}
+
+function persistReaderPreferences() {
+  try {
+    window.localStorage.setItem(
+      readerPrefsKey,
+      JSON.stringify({
+        fontSize: clampReaderFontSize(readerFontSize.value)
+      })
+    )
+  } catch {
+    // Bỏ qua lỗi localStorage để không chặn màn hình đọc.
+  }
+}
+
+function adjustReaderFontSize(offset: number) {
+  readerFontSize.value = clampReaderFontSize(readerFontSize.value + offset)
 }
 
 async function ensureRealtimeVoices(baseUrl?: string) {
@@ -814,37 +838,82 @@ function persistEdgeReadAloudPreferences() {
   )
 }
 
-function focusReaderForEdgeReadAloud() {
-  if (!readerBody.value) return
-  readerBody.value.scrollTop = 0
-  readerBody.value.focus({ preventScroll: true })
-
-  const firstReadable = readerBody.value.querySelector('.reader-paragraph, .reader-heading, .reader-divider') as HTMLElement | null
-  if (!firstReadable) return
-
-  const selection = window.getSelection()
-  if (!selection) return
-
-  const walker = document.createTreeWalker(firstReadable, NodeFilter.SHOW_TEXT, {
+function collectReadableTextNodes(root: HTMLElement) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
       return node.textContent?.trim() ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP
     }
   })
-  const firstTextNode = walker.nextNode()
-  if (!firstTextNode) return
-
-  const range = document.createRange()
-  range.setStart(firstTextNode, 0)
-  range.setEnd(firstTextNode, firstTextNode.textContent?.length ?? 0)
-  selection.removeAllRanges()
-  selection.addRange(range)
+  const textNodes: Text[] = []
+  let currentNode = walker.nextNode()
+  while (currentNode) {
+    textNodes.push(currentNode as Text)
+    currentNode = walker.nextNode()
+  }
+  return textNodes
 }
 
-async function triggerEdgeReadAloudHotkey() {
+function focusReaderForEdgeReadAloud(options: { preserveScroll?: boolean } = {}) {
+  if (!readerBody.value || !readerScanContent.value) return false
+  const preserveScroll = options.preserveScroll ?? false
+  const previousScrollTop = readerBody.value.scrollTop
+  if (!preserveScroll) {
+    readerBody.value.scrollTop = 0
+  }
+  readerBody.value.focus({ preventScroll: preserveScroll })
+
+  const textNodes = collectReadableTextNodes(readerScanContent.value)
+  if (textNodes.length === 0) return false
+  const selection = window.getSelection()
+  if (!selection) return false
+
+  const range = document.createRange()
+  range.setStart(textNodes[0], 0)
+  const lastTextNode = textNodes[textNodes.length - 1]
+  range.setEnd(lastTextNode, lastTextNode.textContent?.length ?? 0)
+  selection.removeAllRanges()
+  selection.addRange(range)
+  if (preserveScroll) {
+    readerBody.value.scrollTop = previousScrollTop
+  }
+  return true
+}
+
+async function prepareEdgeReadAloudSelection(options: { preserveScroll?: boolean } = {}) {
   await nextTick()
-  focusReaderForEdgeReadAloud()
+  const prepared = focusReaderForEdgeReadAloud(options)
+  if (!prepared) {
+    error.value = 'Không tìm thấy khối văn bản để chuyển sang Edge Read Aloud.'
+    return false
+  }
+  error.value = ''
+  return true
+}
+
+async function sendEdgeReadAloudHotkey() {
   await new Promise((resolve) => window.setTimeout(resolve, 180))
   await api.toggleEdgeReadAloud()
+}
+
+async function rescanReaderTextForEdgeReadAloud() {
+  if (!chapterContent.value) return
+  const wasActive = edgeReadAloudActive.value
+  clearEdgeReadAloudTimer()
+
+  if (wasActive) {
+    edgeReadAloudActive.value = false
+    await sendEdgeReadAloudHotkey()
+    await new Promise((resolve) => window.setTimeout(resolve, 220))
+  }
+
+  const prepared = await prepareEdgeReadAloudSelection({ preserveScroll: true })
+  if (!prepared) return
+
+  if (wasActive) {
+    edgeReadAloudActive.value = true
+    await sendEdgeReadAloudHotkey()
+    scheduleEdgeReadAloudAutoNext()
+  }
 }
 
 function scheduleEdgeReadAloudAutoNext() {
@@ -860,7 +929,9 @@ function scheduleEdgeReadAloudAutoNext() {
       return
     }
     await loadChapter(target.id, null, { preservePlayback: true })
-    await triggerEdgeReadAloudHotkey()
+    const prepared = await prepareEdgeReadAloudSelection()
+    if (!prepared) return
+    await sendEdgeReadAloudHotkey()
     scheduleEdgeReadAloudAutoNext()
   }, estimatedMs)
 }
@@ -873,10 +944,12 @@ async function startEdgeReadAloudPlayback() {
   if (!chapterContent.value) return
 
   await stopRealtimePlayback({ quiet: true, clearSession: true })
+  const prepared = await prepareEdgeReadAloudSelection()
+  if (!prepared) return
   error.value = ''
   edgeReadAloudActive.value = true
   activeReadingBlockIndex.value = -1
-  await triggerEdgeReadAloudHotkey()
+  await sendEdgeReadAloudHotkey()
   scheduleEdgeReadAloudAutoNext()
 }
 
@@ -885,7 +958,7 @@ async function stopEdgeReadAloudPlayback() {
   if (!edgeReadAloudActive.value) return
   edgeReadAloudActive.value = false
   activeReadingBlockIndex.value = -1
-  await triggerEdgeReadAloudHotkey()
+  await sendEdgeReadAloudHotkey()
 }
 
 function handleTimeUpdate() {
@@ -1445,6 +1518,11 @@ watch(edgeReadAloudWordsPerMinute, () => {
   }
 })
 
+watch(readerFontSize, () => {
+  readerFontSize.value = clampReaderFontSize(readerFontSize.value)
+  persistReaderPreferences()
+})
+
 onMounted(() => {
   try {
     const raw = window.localStorage.getItem(edgeReadAloudPrefsKey)
@@ -1456,6 +1534,15 @@ onMounted(() => {
   } catch {
     useEdgeReadAloud.value = false
     edgeReadAloudWordsPerMinute.value = 185
+  }
+  try {
+    const raw = window.localStorage.getItem(readerPrefsKey)
+    if (raw) {
+      const parsed = JSON.parse(raw) as { fontSize?: number }
+      readerFontSize.value = clampReaderFontSize(parsed.fontSize ?? 18)
+    }
+  } catch {
+    readerFontSize.value = 18
   }
   void restoreDirectoryHandle()
   void refresh()
@@ -1691,18 +1778,33 @@ onUnmounted(() => {
                 </div>
 
                 <div class="reader-actions">
+                  <div class="reader-font-controls">
+                    <span>Cỡ chữ</span>
+                    <button class="ghost-button font-size-button" @click="adjustReaderFontSize(-1)" :disabled="readerFontSize <= 14">A-</button>
+                    <input v-model.number="readerFontSize" class="font-size-slider" type="range" min="14" max="28" step="1" />
+                    <button class="ghost-button font-size-button" @click="adjustReaderFontSize(1)" :disabled="readerFontSize >= 28">A+</button>
+                    <strong>{{ readerFontSize }}px</strong>
+                  </div>
                   <button class="ghost-button" @click="goToSiblingChapter(-1)" :disabled="!chapterAt(-1)">Chương trước</button>
                   <button class="ghost-button" @click="goToSiblingChapter(1)" :disabled="!chapterAt(1)">Chương sau</button>
                 </div>
               </header>
 
-              <section ref="readerBody" class="reader-body" tabindex="0" @scroll="scheduleProgressSave">
-                <template v-for="(block, index) in formattedChapterBlocks" :key="`${chapterContent.chapterId}-${index}`">
-                  <h3 v-if="block.kind === 'heading'" class="reader-heading" :class="{ 'active-reading': showLegacyReadingHighlight && activeReadingBlockIndex === index }">{{ block.text }}</h3>
-                  <div v-else-if="block.kind === 'divider'" class="reader-divider" :class="{ 'active-reading': showLegacyReadingHighlight && activeReadingBlockIndex === index }">{{ block.text }}</div>
-                  <div v-else-if="block.kind === 'spacer'" class="reader-spacer" aria-hidden="true"></div>
-                  <p v-else class="reader-paragraph" :class="{ 'active-reading': showLegacyReadingHighlight && activeReadingBlockIndex === index }">{{ block.text }}</p>
-                </template>
+              <section
+                ref="readerBody"
+                class="reader-body"
+                :style="{ '--reader-font-size': `${readerFontSize}px` }"
+                tabindex="0"
+                @scroll="scheduleProgressSave"
+              >
+                <div ref="readerScanContent" class="reader-scan-content">
+                  <template v-for="(block, index) in formattedChapterBlocks" :key="`${chapterContent.chapterId}-${index}`">
+                    <h3 v-if="block.kind === 'heading'" class="reader-heading" :class="{ 'active-reading': showLegacyReadingHighlight && activeReadingBlockIndex === index }">{{ block.text }}</h3>
+                    <div v-else-if="block.kind === 'divider'" class="reader-divider" :class="{ 'active-reading': showLegacyReadingHighlight && activeReadingBlockIndex === index }">{{ block.text }}</div>
+                    <div v-else-if="block.kind === 'spacer'" class="reader-spacer" aria-hidden="true"></div>
+                    <p v-else class="reader-paragraph" :class="{ 'active-reading': showLegacyReadingHighlight && activeReadingBlockIndex === index }">{{ block.text }}</p>
+                  </template>
+                </div>
               </section>
 
               <footer v-if="isEdgeBrowser" class="edge-read-aloud-dock" :class="{ active: edgeReadAloudActive }">
@@ -1715,6 +1817,21 @@ onUnmounted(() => {
                     <span>WPM</span>
                     <input v-model.number="edgeReadAloudWordsPerMinute" type="number" min="120" max="260" step="5" />
                   </label>
+                  <div v-if="useEdgeReadAloud" class="reader-font-controls reader-font-controls--compact">
+                    <span>Cỡ chữ</span>
+                    <button class="ghost-button font-size-button" @click="adjustReaderFontSize(-1)" :disabled="readerFontSize <= 14">A-</button>
+                    <input v-model.number="readerFontSize" class="font-size-slider" type="range" min="14" max="28" step="1" />
+                    <button class="ghost-button font-size-button" @click="adjustReaderFontSize(1)" :disabled="readerFontSize >= 28">A+</button>
+                    <strong>{{ readerFontSize }}px</strong>
+                  </div>
+                  <button
+                    v-if="useEdgeReadAloud"
+                    class="ghost-button edge-dock-scan"
+                    @click="rescanReaderTextForEdgeReadAloud"
+                    :disabled="!chapterContent"
+                  >
+                    {{ edgeReadAloudActive ? 'Quét lại khối chữ' : 'Quét khối chữ' }}
+                  </button>
                 </div>
 
                 <div class="edge-dock-actions">
@@ -2147,6 +2264,10 @@ button:disabled {
   flex-wrap: wrap;
 }
 
+.edge-dock-scan {
+  min-width: 9rem;
+}
+
 .edge-dock-actions {
   display: flex;
   align-items: center;
@@ -2183,6 +2304,45 @@ button:disabled {
   align-items: center;
   flex-wrap: wrap;
   gap: 0.5rem;
+}
+
+.reader-font-controls {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  padding: 0.55rem 0.8rem;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.5);
+}
+
+.reader-font-controls span,
+.reader-font-controls strong {
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+}
+
+.reader-font-controls strong {
+  color: var(--text-primary);
+}
+
+.reader-font-controls--compact {
+  padding: 0.45rem 0.7rem;
+  background: rgba(15, 23, 42, 0.36);
+}
+
+.reader-font-controls--compact .font-size-slider {
+  width: 5.75rem;
+}
+
+.font-size-button {
+  min-width: 3rem;
+  padding-inline: 0.7rem;
+}
+
+.font-size-slider {
+  width: 7rem;
 }
 
 .premium-player-column {
@@ -2644,34 +2804,51 @@ button:disabled {
 .reader-body {
   flex: 1;
   overflow-y: auto;
-  padding: 1.5rem 1.8rem 2rem;
-  font-family: var(--font-serif);
-  font-size: 1.08rem;
-  line-height: 1.9;
+  padding: 1.75rem 2rem 2.4rem;
+  font-family: var(--font-sans);
+  font-size: var(--reader-font-size, 18px);
+  font-weight: 450;
+  letter-spacing: 0.01em;
+  line-height: 2;
   scroll-behavior: smooth;
 }
 
+.reader-body > * {
+  width: min(100%, 74ch);
+  margin-inline: auto;
+}
+
+.reader-scan-content {
+  width: 100%;
+}
+
 .reader-heading {
-  margin: 0 0 1rem;
+  margin: 0 0 1.1rem;
   color: var(--text-primary);
   font-family: var(--font-sans);
-  font-size: 1.08rem;
+  font-size: calc(var(--reader-font-size, 18px) * 1.08);
   font-weight: 700;
+  letter-spacing: -0.015em;
   white-space: pre-wrap;
 }
 
 .reader-paragraph {
-  margin: 0;
+  margin: 0 0 1.15rem;
   color: var(--text-primary);
   white-space: pre-wrap;
-  line-height: 1.9;
+  text-align: left;
+  text-indent: 0;
+  line-height: 2;
+  text-wrap: pretty;
 }
 
 .reader-divider {
-  margin: 0;
+  margin: 0 0 1rem;
   color: var(--text-muted);
   white-space: pre-wrap;
+  font-size: 0.84em;
   letter-spacing: 0.04em;
+  opacity: 0.82;
 }
 
 .reader-spacer {

@@ -17,8 +17,8 @@
   --radius-md: 12px;
   --radius-sm: 8px;
   
-  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
-  --font-serif: 'Literata', 'Georgia', serif;
+  --font-sans: 'Segoe UI', 'Inter', 'Helvetica Neue', Arial, system-ui, -apple-system, sans-serif;
+  --font-serif: 'Segoe UI', 'Inter', 'Helvetica Neue', Arial, system-ui, -apple-system, sans-serif;
 }
 
 * {
@@ -84,7 +84,7 @@ button, input, select {
 .reader-paragraph {
   margin: 0 0 1rem;
   color: var(--text-primary);
-  font-family: var(--font-serif);
+  font-family: var(--font-sans);
   font-size: 1.05rem;
   line-height: 2;
   text-align: justify;

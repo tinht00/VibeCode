@@ -3,7 +3,7 @@
 ## 1. Nhận diện dự án
 - Tên: `story-tts`
 - Mô tả ngắn: `App local để import thư mục truyện TXT, đọc trực tiếp trong web app và phát TTS theo từng chương.`
-- Stack chính: `Go + Gin, Vue 3 + Vite, ffmpeg, edge-tts compatible providers`
+- Stack chính: `Go + Gin, Vue 3 + Vite, FastAPI, ffmpeg, edge-tts`
 
 ## 2. Thành phần chính
 - `Governance kit`: `AGENTS.md`, `.agent/`, `docs/` cho điều hướng và tri thức dự án
@@ -13,11 +13,14 @@
 
 ## 3. Lệnh và điểm vào quan trọng
 - Backend dev: `go run ./cmd/api`
+- TTS service dev: `data/run/tts-venv/Scripts/python.exe -m uvicorn tts_service.app:app --host 127.0.0.1 --port 8010`
 - Backend build: `go build ./...`
 - Frontend dev: `npm run dev`
 - Frontend build: `npm run build`
+- Docker local: `docker compose up -d --build`
 - Backend entrypoint: `backend/cmd/api/main.go`
 - Frontend entrypoint: `frontend/src/main.ts`
+- Environment setup: `.codex/environments/setup.ps1`
 
 ## 4. Ràng buộc ổn định cần nhớ
 - Không được coi notebook hay chat là nguồn sự thật cho runtime; khi có code, source code là chuẩn.
@@ -36,5 +39,5 @@
 ## 6. Ghi chú vận hành
 - Notebook canonical đã tồn tại thật với ID `04b036e8-540b-43f7-999a-3d3e1dd8a747`.
 - `ffmpeg` cần có trên PATH nếu chapter dài bị chia nhiều segment và cần merge lại thành một file MP3.
-- Provider mặc định hiện gọi `edge-tts` CLI; nếu máy chưa cài, API direct speak sẽ fail rõ với lỗi thực thi provider.
+- `tts_service` ưu tiên binary `edge-tts` trong `data/run/tts-venv`, nên worktree mới nên chạy `.codex/environments/setup.ps1` trước khi verify end-to-end audio.
 - Đây là dự án độc lập; các tham chiếu tới `andon-tts-web-api` chỉ nhằm tái sử dụng pattern kỹ thuật.

@@ -27,10 +27,24 @@ DEFAULT_PORT = int(os.getenv("STORY_TTS_REALTIME_PORT", "8010"))
 DEFAULT_VOICE = os.getenv("STORY_TTS_REALTIME_TTS_VOICE", "vi-VN-HoaiMyNeural")
 DEFAULT_SPEED = int(os.getenv("STORY_TTS_REALTIME_TTS_SPEED", "0"))
 DEFAULT_PITCH = int(os.getenv("STORY_TTS_REALTIME_TTS_PITCH", "0"))
-DEFAULT_EDGE_BINARY = os.getenv(
-    "STORY_TTS_EDGE_BINARY",
-    os.path.expandvars(r"%AppData%\Python\Python313\Scripts\edge-tts.exe"),
-)
+
+
+def resolve_default_edge_binary() -> str:
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    local_venv_binary = os.path.join(
+        repo_root,
+        "data",
+        "run",
+        "tts-venv",
+        "Scripts",
+        "edge-tts.exe",
+    )
+    if os.path.exists(local_venv_binary):
+        return local_venv_binary
+    return os.path.expandvars(r"%AppData%\Python\Python313\Scripts\edge-tts.exe")
+
+
+DEFAULT_EDGE_BINARY = os.getenv("STORY_TTS_EDGE_BINARY", resolve_default_edge_binary())
 
 
 class ChapterPayload(BaseModel):
