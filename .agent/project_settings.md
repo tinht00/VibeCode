@@ -24,3 +24,15 @@ Luôn tuân thủ cấu trúc:
 3.  **Lưu ý**: Các cảnh báo hoặc điểm cần tối ưu.
 
 Hãy làm việc một cách **Strict & Explicit** (Chặt chẽ & Tường minh).
+
+## 5. Personalization Cho Research Bằng NotebookLM
+- Khi tác vụ có yếu tố nghiên cứu/tổng hợp bối cảnh lớn, ưu tiên truy xuất theo nhịp thay vì nạp toàn bộ tài liệu vào context.
+- Nhịp truy xuất chuẩn:
+  1. Preflight (auth, notebook, khả năng truy cập nguồn).
+  2. Query hẹp theo mục tiêu task.
+  3. Interrogate (mâu thuẫn, khoảng trống, độ tin cậy).
+  4. Generate output sau quality gate.
+- Quality gate bắt buộc trước khi kết luận:
+  - Có dẫn chứng cho các nhận định chính.
+  - Nêu rõ phần chưa đủ bằng chứng.
+  - Có mức tự tin và rủi ro còn lại.
