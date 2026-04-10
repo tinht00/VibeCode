@@ -106,6 +106,7 @@ let activeSocket: WebSocket | null = null
 let socketClosedByApp = false
 let activeMediaSource: MediaSource | null = null
 let activeSourceBuffer: SourceBuffer | null = null
+let isPlaybackActive = false  // Theo dõi xem đang trong phiên playback không
 let activeMediaUrl = ''
 let queuedAudioChunks: Uint8Array[] = []
 let pendingMediaEnd = false
@@ -113,6 +114,8 @@ let userPausedAudio = false
 let edgeReadAloudTimer: number | null = null
 const activeTab = ref<'library' | 'reader'>('library')
 const activeReadingBlockIndex = ref(-1)
+const shouldAutoScroll = ref(false)  // Chỉ scroll khi user đã scroll thủ công
+let userHasScrolled = false
 const audioCurrentTime = ref(0)
 const audioDuration = ref(0)
 const readerFontSize = ref(18)
@@ -669,11 +672,13 @@ async function loadDirectoryHandle() {
 }
 
 async function loadStory(storyId: number) {
+  console.log('loadStory starting with storyId:', storyId)
   await stopRealtimePlayback({ quiet: true, clearSession: true })
   loading.value = true
   error.value = ''
   try {
     const [detail, progress] = await Promise.all([api.story(storyId), api.progress(storyId)])
+    console.log('loadStory loaded detail for:', detail.story.id, detail.story.title)
     selectedStory.value = detail
     readerProgress.value = progress.storyId ? progress : null
     progressByStory.value = {
@@ -718,15 +723,54 @@ function storyContinueText(story: Story) {
   return `Đọc tiếp chương ${nextChapter}`
 }
 
+async function selectStory(storyId: number) {
+  console.log('selectStory called with storyId:', storyId)
+  await loadStory(storyId)
+}
+
 async function openStoryReader(storyId: number) {
+  console.log('openStoryReader called with storyId:', storyId)
   activeTab.value = 'reader'
   await loadStory(storyId)
 }
 
 async function continueStory(storyId: number, event?: Event) {
   event?.stopPropagation()
+  console.log('continueStory called with storyId:', storyId)
   activeTab.value = 'reader'
   await loadStory(storyId)
+}
+
+async function selectChapter(chapterId: number, event?: Event) {
+  event?.stopPropagation()
+  console.log('selectChapter called with chapterId:', chapterId)
+  activeTab.value = 'reader'
+  await loadChapter(chapterId, null, { switchTab: true, skipPersist: false })
+  
+  // Lưu progress để đánh dấu chương đã đọc
+  if (selectedStory.value) {
+    const chapter = selectedStory.value.chapters.find(c => c.id === chapterId)
+    if (chapter) {
+      await markChapterRead(selectedStory.value.story.id, chapter.chapterIndex)
+    }
+  }
+}
+
+async function markChapterRead(storyId: number, chapterIndex: number) {
+  const progress = progressByStory.value[storyId]
+  if (progress && chapterIndex > progress.chapterIndex) {
+    progress.chapterIndex = chapterIndex
+    progress.scrollPercent = 0
+    progress.audioPositionSec = 0
+    await api.saveProgress(progress)
+  }
+}
+
+function isChapterRead(chapter: Chapter): boolean {
+  if (!selectedStory.value) return false
+  const progress = progressByStory.value[selectedStory.value.story.id]
+  if (!progress) return false
+  return chapter.chapterIndex <= progress.chapterIndex
 }
 
 async function loadChapter(chapterId: number, progress?: ReaderProgress | null, options: LoadChapterOptions & { switchTab?: boolean } = {}) {
@@ -1057,10 +1101,50 @@ function updateActiveReadingBlock() {
 
 function autoScrollToActiveBlock() {
   if (activeReadingBlockIndex.value === -1 || !readerBody.value) return
+  
   const el = readerBody.value.children[activeReadingBlockIndex.value] as HTMLElement
-  if (el) {
+  if (!el) return
+  
+  // Chỉ scroll nếu block nằm ngoài viewport
+  const rect = el.getBoundingClientRect()
+  const containerRect = readerBody.value.getBoundingClientRect()
+  
+  const isVisible = rect.top >= containerRect.top && rect.bottom <= containerRect.bottom
+  if (!isVisible) {
+    // Scroll với offset để block không bị dính sát mép
     el.scrollIntoView({ behavior: 'smooth', block: 'center' })
   }
+}
+
+function findBlockIndexByText(segmentText: string): number {
+  if (!segmentText || !formattedChapterBlocks.value.length) return -1
+  
+  // Lấy ~80 ký tự đầu của segment text (đủ để match với block)
+  const searchPrefix = segmentText.trim().slice(0, 80).toLowerCase()
+  if (!searchPrefix) return -1
+  
+  // Tìm block có text bắt đầu giống với segment text
+  for (let i = 0; i < formattedChapterBlocks.value.length; i++) {
+    const block = formattedChapterBlocks.value[i]
+    if (block.kind === 'spacer') continue
+    
+    const blockText = block.text.trim().toLowerCase()
+    if (!blockText) continue
+    
+    // Chỉ match khi block text tương đối ngắn và bắt đầu giống segment
+    // Điều này tránh match chunk dài với block ngắn
+    const minLen = Math.min(blockText.length, searchPrefix.length, 60)
+    if (minLen >= 20 && blockText.slice(0, minLen) === searchPrefix.slice(0, minLen)) {
+      return i
+    }
+    
+    // Nếu block text ngắn, kiểm tra chứa trong searchPrefix
+    if (blockText.length < 100 && searchPrefix.includes(blockText)) {
+      return i
+    }
+  }
+  
+  return -1
 }
 
 async function buildRealtimePayload() {
@@ -1132,6 +1216,7 @@ async function startRealtimePlayback() {
     realtimeSession.value = session
     realtimeCurrentChapterId.value = session.chapterId
     realtimeCurrentChapterTitle.value = selectedChapter.value.title
+    isPlaybackActive = true  // Đánh dấu bắt đầu phiên playback
     connectRealtimeSocket(baseUrl, session.id)
   } catch (err) {
     realtimeStatus.value = 'error'
@@ -1229,6 +1314,7 @@ async function stopRealtimePlayback(options: { quiet?: boolean; clearSession?: b
 }
 
 async function prepareRealtimeMediaStream() {
+  console.log('[MediaStream] Preparing realtime media stream...')
   resetRealtimeMediaStream()
 
   if (!window.MediaSource || !MediaSource.isTypeSupported('audio/mpeg')) {
@@ -1247,11 +1333,62 @@ async function prepareRealtimeMediaStream() {
   currentStreamMime.value = 'audio/mpeg'
   pendingMediaEnd = false
   queuedAudioChunks = []
+  isPlaybackActive = true
 
-  activeMediaSource.addEventListener('sourceopen', handleSourceOpen, { once: true })
+  console.log('[MediaStream] MediaSource created, waiting for sourceopen...')
+  
+  // Đợi sourceopen event với timeout dài hơn (30s) để tránh timeout khi backend retry
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      console.warn('[MediaStream] Timeout waiting for sourceopen after 30s, proceeding anyway...')
+      resolve()  // Không reject, tiếp tục để tránh reset
+    }, 30000)
+    
+    if (activeMediaSource!.readyState === 'open') {
+      clearTimeout(timeout)
+      console.log('[MediaStream] MediaSource already open')
+      resolve()
+    } else {
+      activeMediaSource!.addEventListener('sourceopen', () => {
+        clearTimeout(timeout)
+        console.log('[MediaStream] MediaSource sourceopen received, ready for audio')
+        resolve()
+      }, { once: true })
+    }
+  })
+  
+  // Setup source buffer
+  if (activeMediaSource && activeMediaSource.readyState === 'open') {
+    try {
+      activeSourceBuffer = activeMediaSource.addSourceBuffer(currentStreamMime.value)
+      activeSourceBuffer.mode = 'sequence'
+      activeSourceBuffer.addEventListener('updateend', flushAudioChunkQueue)
+      console.log('[MediaStream] SourceBuffer created and ready')
+    } catch (err) {
+      console.error('[MediaStream] Failed to create SourceBuffer:', err)
+      throw err
+    }
+  } else {
+    console.warn('[MediaStream] MediaSource not open yet, will setup SourceBuffer when ready')
+    activeMediaSource.addEventListener('sourceopen', () => {
+      if (activeMediaSource && activeMediaSource.readyState === 'open') {
+        try {
+          activeSourceBuffer = activeMediaSource.addSourceBuffer(currentStreamMime.value)
+          activeSourceBuffer.mode = 'sequence'
+          activeSourceBuffer.addEventListener('updateend', flushAudioChunkQueue)
+          console.log('[MediaStream] SourceBuffer created on sourceopen event')
+        } catch (err) {
+          console.error('[MediaStream] Failed to create SourceBuffer on sourceopen:', err)
+        }
+      }
+    }, { once: true })
+  }
+  
   audioRef.value.src = activeMediaUrl
   audioRef.value.autoplay = false
   audioRef.value.load()
+  
+  console.log('[MediaStream] Audio player setup complete, waiting for backend audio chunks...')
 }
 
 function handleSourceOpen() {
@@ -1289,17 +1426,36 @@ function flushAudioChunkQueue() {
     return
   }
 
-  if (audioRef.value?.paused && !userPausedAudio) {
-    let bufferedSeconds = 0
-    try {
-      if (sourceBuffer.buffered.length > 0) {
-        bufferedSeconds = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1)
-      }
-    } catch {
-      bufferedSeconds = 0
+  // Kiểm tra buffered time để quản lý playback
+  let bufferedSeconds = 0
+  let currentTime = 0
+  try {
+    if (sourceBuffer.buffered.length > 0) {
+      bufferedSeconds = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1)
     }
+    if (audioRef.value && !isNaN(audioRef.value.currentTime)) {
+      currentTime = audioRef.value.currentTime
+    }
+  } catch {
+    bufferedSeconds = 0
+  }
+
+  const remainingBuffer = bufferedSeconds - currentTime
+
+  // Nếu buffer sắp hết (< 2s) và đang play, pause để tránh lỗi
+  // Nhưng KHÔNG reset audio element - giữ nguyên currentTime
+  if (remainingBuffer < 2 && audioRef.value && !audioRef.value.paused && !userPausedAudio) {
+    console.log(`[Audio] Buffer low (${remainingBuffer.toFixed(1)}s at ${currentTime.toFixed(1)}s), pausing to wait for backend retry...`)
+    audioRef.value.pause()
+  }
+
+  if (audioRef.value?.paused && !userPausedAudio) {
+    // Resume playback khi có đủ buffer (>= 4s) hoặc khi kết thúc stream
     if (bufferedSeconds >= 4 || pendingMediaEnd) {
-      void audioRef.value.play().catch(() => undefined)
+      console.log(`[Audio] Buffer sufficient (${bufferedSeconds.toFixed(1)}s), resuming from ${currentTime.toFixed(1)}s...`)
+      void audioRef.value.play().catch((err) => {
+        console.error('[Audio] Failed to resume playback:', err)
+      })
     }
   }
 
@@ -1309,7 +1465,9 @@ function flushAudioChunkQueue() {
     const buffer = chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength) as ArrayBuffer
     try {
       sourceBuffer.appendBuffer(buffer)
-    } catch {
+      console.log(`[Audio] Appended chunk: ${buffer.byteLength} bytes, total buffered: ${bufferedSeconds.toFixed(1)}s`)
+    } catch (err) {
+      console.error('[Audio] Failed to append chunk:', err)
       // Có thể bị teardown đúng lúc append; bỏ qua để tránh lỗi runtime.
     }
     return
@@ -1327,12 +1485,23 @@ function flushAudioChunkQueue() {
 function finishRealtimeStream() {
   pendingMediaEnd = true
   flushAudioChunkQueue()
+  // Reset flags khi kết thúc stream
+  shouldAutoScroll.value = false
+  isPlaybackActive = false  // Đánh dấu kết thúc phiên playback
 }
 
 function resetRealtimeMediaStream() {
+  // KHÔNG reset nếu đang trong phiên playback active
+  // Điều này tránh audio bị restart khi backend đang retry chunk
+  if (isPlaybackActive && activeMediaSource && activeMediaSource.readyState === 'open') {
+    console.log('[MediaStream] Skipping reset during active playback to avoid audio restart')
+    return
+  }
+  
   pendingMediaEnd = false
   queuedAudioChunks = []
   userPausedAudio = false
+  isPlaybackActive = false
 
   if (activeSourceBuffer) {
     activeSourceBuffer.removeEventListener('updateend', flushAudioChunkQueue)
@@ -1423,10 +1592,31 @@ function handleRealtimeEvent(event: RealtimeSessionState) {
       realtimeStatus.value = 'buffering'
       realtimeError.value = ''
       break
+    case 'segment_started':
+      // Highlight block khớp với sub-segment text đang được đọc
+      if (event.segmentText && showLegacyReadingHighlight.value) {
+        const targetIndex = findBlockIndexByText(event.segmentText)
+        if (targetIndex >= 0 && activeReadingBlockIndex.value !== targetIndex) {
+          activeReadingBlockIndex.value = targetIndex
+          // Chỉ scroll nếu user đã scroll thủ công trước đó
+          if (userHasScrolled) {
+            setTimeout(() => {
+              autoScrollToActiveBlock()
+            }, 300)
+          }
+        }
+      }
+      break
+    case 'chunk_started':
+      break
+    case 'chunk_finished':
+      break
     case 'chapter_started':
       realtimeStatus.value = 'reading'
       realtimeCurrentChapterId.value = event.chapterId ?? null
       realtimeCurrentChapterTitle.value = event.chapterTitle ?? ''
+      // KHÔNG tự động bật auto-scroll - chỉ bật khi user scroll thủ công
+      // shouldAutoScroll.value sẽ được bật bởi scroll event listener
       if (event.chapterId) {
         void loadChapter(event.chapterId, null, { preservePlayback: true })
       }
@@ -1441,10 +1631,16 @@ function handleRealtimeEvent(event: RealtimeSessionState) {
     case 'story_finished':
       realtimeStatus.value = 'finished'
       finishRealtimeStream()
+      // Reset scroll flags khi kết thúc truyện
+      shouldAutoScroll.value = false
+      userHasScrolled = false
       break
     case 'stopped':
       realtimeStatus.value = 'stopped'
       finishRealtimeStream()
+      // Reset scroll flags khi dừng
+      shouldAutoScroll.value = false
+      userHasScrolled = false
       break
     case 'stream_closed':
       if (!['finished', 'stopped', 'error'].includes(realtimeStatus.value)) {
@@ -1477,6 +1673,15 @@ async function goToSiblingChapter(offset: number) {
     await stopEdgeReadAloudPlayback()
   }
   await loadChapter(target.id, null)
+  
+  // Đánh dấu chương đã đọc
+  if (selectedStory.value) {
+    const chapter = selectedStory.value.chapters.find(c => c.id === target.id)
+    if (chapter) {
+      await markChapterRead(selectedStory.value.story.id, chapter.chapterIndex)
+    }
+  }
+  
   if (shouldResumeRealtime) {
     await startRealtimePlayback()
   }
@@ -1544,6 +1749,22 @@ onMounted(() => {
   } catch {
     readerFontSize.value = 18
   }
+  
+  // Lắng nghe scroll event để bật auto-scroll khi user scroll thủ công
+  const setupScrollListener = () => {
+    if (readerBody.value) {
+      readerBody.value.addEventListener('scroll', () => {
+        userHasScrolled = true
+        shouldAutoScroll.value = true
+      }, { passive: true })
+    }
+  }
+  
+  // Đợi reader render xong rồi attach listener
+  nextTick(() => {
+    setupScrollListener()
+  })
+  
   void restoreDirectoryHandle()
   void refresh()
 })
@@ -1607,7 +1828,7 @@ onUnmounted(() => {
           <p v-if="currentLibraryRoot" class="meta library-root">Đang theo dõi: {{ currentLibraryRoot }}</p>
 
           <div v-if="recentStories.length" class="recent-strip">
-            <button v-for="story in recentStories" :key="`recent-${story.id}`" class="recent-chip" @click="openStoryReader(story.id)">
+            <button v-for="story in recentStories" :key="`recent-${story.id}`" class="recent-chip" @click="selectStory(story.id)">
               {{ story.title }}
             </button>
           </div>
@@ -1618,8 +1839,8 @@ onUnmounted(() => {
             v-for="story in sortedStories"
             :key="story.id"
             class="story-card compact-story-card panel gallery-story-card"
-            :class="{ active: selectedStory?.story.id === story.id }"
-            @click="openStoryReader(story.id)"
+            :class="{ active: selectedStory != null && selectedStory.story.id === story.id }"
+            @click.stop="selectStory(story.id)"
           >
             <div class="story-card-top">
               <strong>{{ story.title }}</strong>
@@ -1659,8 +1880,11 @@ onUnmounted(() => {
             v-for="chapter in selectedStory.chapters"
             :key="chapter.id"
             class="chapter-card"
-            :class="{ active: selectedChapterId === chapter.id || realtimeCurrentChapterId === chapter.id }"
-            @click="loadChapter(chapter.id, null)"
+            :class="{ 
+              active: selectedChapterId === chapter.id || realtimeCurrentChapterId === chapter.id,
+              'chapter-read': isChapterRead(chapter)
+            }"
+            @click="selectChapter(chapter.id, $event)"
           >
             <strong>Chương {{ chapter.chapterIndex }}</strong>
             <span>{{ chapter.title }}</span>
@@ -2190,6 +2414,15 @@ button:disabled {
   background: var(--bg-active);
   color: var(--text-active);
   border-color: var(--bg-active);
+}
+
+.chapter-card.chapter-read:not(.active) {
+  background: rgba(96, 165, 250, 0.08);
+  border-left: 3px solid rgba(96, 165, 250, 0.4);
+}
+
+.chapter-card.chapter-read:not(.active) strong {
+  color: rgba(96, 165, 250, 0.85);
 }
 
 .story-card.active *,
@@ -2835,6 +3068,7 @@ button:disabled {
 .reader-paragraph {
   margin: 0 0 1.15rem;
   color: var(--text-primary);
+  font-size: var(--reader-font-size, 18px);
   white-space: pre-wrap;
   text-align: left;
   text-indent: 0;
@@ -2845,8 +3079,8 @@ button:disabled {
 .reader-divider {
   margin: 0 0 1rem;
   color: var(--text-muted);
+  font-size: calc(var(--reader-font-size, 18px) * 0.84);
   white-space: pre-wrap;
-  font-size: 0.84em;
   letter-spacing: 0.04em;
   opacity: 0.82;
 }

@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import os
 import re
-import subprocess
-import tempfile
 import threading
 import time
 import uuid
@@ -15,39 +12,36 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-import edge_tts
+from pydantic import BaseModel
 
+from RealtimeTTS import TextToAudioStream, EdgeEngine
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("story_tts_realtime")
+logging.basicConfig(level=logging.INFO)
 
-DEFAULT_HOST = os.getenv("STORY_TTS_REALTIME_HOST", "127.0.0.1")
-DEFAULT_PORT = int(os.getenv("STORY_TTS_REALTIME_PORT", "8010"))
-DEFAULT_VOICE = os.getenv("STORY_TTS_REALTIME_TTS_VOICE", "vi-VN-HoaiMyNeural")
-DEFAULT_SPEED = int(os.getenv("STORY_TTS_REALTIME_TTS_SPEED", "0"))
-DEFAULT_PITCH = int(os.getenv("STORY_TTS_REALTIME_TTS_PITCH", "0"))
+app = FastAPI(title="story-tts-realtime", version="0.2.0")
 
-
-def resolve_default_edge_binary() -> str:
-    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    local_venv_binary = os.path.join(
-        repo_root,
-        "data",
-        "run",
-        "tts-venv",
-        "Scripts",
-        "edge-tts.exe",
-    )
-    if os.path.exists(local_venv_binary):
-        return local_venv_binary
-    return os.path.expandvars(r"%AppData%\Python\Python313\Scripts\edge-tts.exe")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-DEFAULT_EDGE_BINARY = os.getenv("STORY_TTS_EDGE_BINARY", resolve_default_edge_binary())
+# ─── Models ──────────────────────────────────────────────────────────────────
 
 
-class ChapterPayload(BaseModel):
+class RealtimeVoice(BaseModel):
+    id: str
+    name: str
+    locale: str
+    gender: str
+    friendlyName: str
+
+
+class RealtimeChapterPayload(BaseModel):
     chapterId: int
     chapterIndex: int
     title: str
@@ -57,8 +51,8 @@ class ChapterPayload(BaseModel):
 class CreateSessionRequest(BaseModel):
     storyId: int
     chapterId: int
-    chapters: list[ChapterPayload] = Field(default_factory=list)
-    voice: str | None = None
+    chapters: list[RealtimeChapterPayload]
+    voice: str = "vi-VN-NamMinhNeural"
     speed: int = 0
     pitch: int = 0
     autoNext: bool = True
@@ -87,6 +81,9 @@ def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
 
 
+# ─── Text Processing ──────────────────────────────────────────────────────────
+
+
 def normalize_text(text: str) -> str:
     cleaned = text.replace("\r\n", "\n").replace("\r", "\n")
     cleaned = re.sub(r"[ \t]+", " ", cleaned)
@@ -98,32 +95,8 @@ def normalize_text(text: str) -> str:
     return cleaned.strip()
 
 
-def split_sentences(text: str) -> list[str]:
-    parts = re.split(r"(?<=[.!?…])\s+", text)
-    return [part.strip() for part in parts if part.strip()]
-
-
-def split_hard_segment(text: str, limit: int) -> list[str]:
-    if len(text) <= limit:
-        return [text]
-
-    out: list[str] = []
-    current = ""
-
-    for word in text.split():
-        candidate = f"{current} {word}".strip()
-        if current and len(candidate) > limit:
-            out.append(current)
-            current = word
-            continue
-        current = candidate
-
-    if current:
-        out.append(current)
-    return out
-
-
-def split_stream_segments(text: str, max_chars: int = 900) -> list[str]:
+def split_chapter_into_chunks(text: str, num_chunks: int = 20) -> list[str]:
+    """Chia chapter thành nhiều đoạn nhỏ để tổng hợp tuần tự."""
     normalized = normalize_text(text)
     if not normalized:
         return []
@@ -132,123 +105,151 @@ def split_stream_segments(text: str, max_chars: int = 900) -> list[str]:
     if not paragraphs:
         return []
 
-    segments: list[str] = []
+    total_chars = sum(len(p) for p in paragraphs)
+    chars_per_chunk = total_chars // num_chunks
 
+    if chars_per_chunk < 200:
+        return ['\n\n'.join(paragraphs)]
+
+    chunks = []
+    current_chunk = []
+    current_length = 0
+
+    for para in paragraphs:
+        current_chunk.append(para)
+        current_length += len(para)
+
+        if current_length >= chars_per_chunk and len(chunks) < num_chunks - 1:
+            chunks.append('\n\n'.join(current_chunk))
+            current_chunk = []
+            current_length = 0
+
+    if current_chunk:
+        chunks.append('\n\n'.join(current_chunk))
+
+    logger.info("Chapter split into %d chunks (target: %d, avg %d chars each)",
+               len(chunks), num_chunks, total_chars // max(len(chunks), 1))
+    return chunks
+
+
+def split_into_segments(text: str, max_chars: int = 600) -> list[str]:
+    """Chia text thành các đoạn nhỏ cho highlighting."""
+    normalized = normalize_text(text)
+    if not normalized:
+        return []
+
+    paragraphs = [part.strip() for part in re.split(r"\n{2,}", normalized) if part.strip()]
+    if not paragraphs:
+        return []
+
+    segments = []
     for paragraph in paragraphs:
         if len(paragraph) <= max_chars:
             segments.append(paragraph)
-            continue
-        segments.extend(split_hard_segment(paragraph, max_chars))
+        else:
+            sentences = re.split(r'(?<=[.!?])\s+', paragraph)
+            current = ""
+            for sentence in sentences:
+                if len(current) + len(sentence) <= max_chars:
+                    current += (" " if current else "") + sentence
+                else:
+                    if current:
+                        segments.append(current)
+                    current = sentence
+            if current:
+                segments.append(current)
 
     return segments
 
 
 def prepare_tts_segment(text: str) -> str:
-    normalized = normalize_text(text)
-    if not normalized:
-        return ""
-    if normalized[-1] not in ".!?…:;":
-        normalized = f"{normalized}."
-    return normalized
+    return normalize_text(text)
 
 
-def synthesize_segment_with_edge_cli(
+# ─── RealtimeTTS Synthesis ────────────────────────────────────────────────────
+
+
+def synthesize_chunk_realtime(
     text: str,
     voice: str,
     speed: int,
     pitch: int,
     session: "RuntimeSession",
-) -> bytes:
+    on_chunk_callback,
+    max_retries: int = 5,
+) -> tuple[int, float]:
+    """
+    Sử dụng RealtimeTTS để tổng hợp và stream audio real-time.
+    Trả về (total_bytes, estimated_duration_seconds).
+    """
     if not text.strip():
-        return b""
+        return 0, 0.0
 
-    edge_binary = DEFAULT_EDGE_BINARY
-    if not os.path.exists(edge_binary):
-        raise RuntimeError(f"Không tìm thấy edge-tts binary tại {edge_binary}")
+    last_error = None
+    rate_percent = speed  # RealtimeTTS dùng -100 đến 100
+    pitch_hz = pitch      # RealtimeTTS dùng -100 đến 100
 
-    with tempfile.TemporaryDirectory(prefix="story-tts-realtime-") as temp_dir:
-        text_path = os.path.join(temp_dir, "segment.txt")
-        audio_path = os.path.join(temp_dir, "segment.mp3")
-        with open(text_path, "w", encoding="utf-8") as handle:
-            handle.write(text)
+    for attempt in range(1, max_retries + 1):
+        try:
+            # Tạo EdgeEngine với voice được chỉ định
+            engine = EdgeEngine(voice=voice)
 
-        base_cmd = [
-            edge_binary,
-            "--voice",
-            voice,
-            "--file",
-            text_path,
-            "--write-media",
-            audio_path,
-        ]
+            # Tạo TextToAudioStream
+            stream = TextToAudioStream(engine)
+            stream.feed(text)
 
-        command_variants: list[list[str]] = []
-        if speed != 0 or pitch != 0:
-            variant = [*base_cmd]
-            if speed != 0:
-                variant.append(f"--rate={format_rate(speed)}")
-            if pitch != 0:
-                variant.append(f"--pitch={format_pitch(pitch)}")
-            command_variants.append(variant)
-        command_variants.append(base_cmd)
+            # Stream audio real-time với callback
+            total_bytes = 0
+            chunk_count = 0
 
-        last_error = "edge-tts lỗi"
-        for cmd in command_variants:
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
+            def on_audio_chunk(chunk: bytes):
+                nonlocal total_bytes, chunk_count
+                total_bytes += len(chunk)
+                chunk_count += 1
+                on_chunk_callback(chunk)
+
+            # Synthesize và stream real-time
+            # muted=True để không play ra loa, chỉ callback
+            stream.play(
+                on_audio_chunk=on_audio_chunk,
+                muted=True,
+                rate=rate_percent,
+                pitch=pitch_hz,
             )
-            session.current_stream = process
 
-            while process.poll() is None:
-                if session.stop_requested.is_set():
-                    process.kill()
-                    raise RuntimeError("Đã dừng synth realtime")
-                with session.lock:
-                    if session.pending_index is not None:
-                        process.kill()
-                        raise RuntimeError("Đã chuyển chapter khi đang synth")
-                time.sleep(0.05)
+            if total_bytes > 0:
+                # Ước lượng thời lượng: PCM/WAV ~16KB/s cho voice 16kHz mono
+                # RealtimeTTS output là PCM format
+                speed_factor = 1.0 + (speed / 100.0)
+                BYTES_PER_SECOND = 16000  # ~16KB/s cho PCM 16kHz mono
+                estimated_duration = total_bytes / (BYTES_PER_SECOND * speed_factor)
 
-            stdout, stderr = process.communicate()
-            session.current_stream = None
+                logger.debug("Synthesized chunk: %d bytes (%d chunks), estimated %.1fs",
+                           total_bytes, chunk_count, estimated_duration)
+                return total_bytes, estimated_duration
+            else:
+                raise RuntimeError("RealtimeTTS không tạo được audio")
 
-            if process.returncode == 0 and os.path.exists(audio_path):
-                break
+        except Exception as e:
+            last_error = e
+            logger.warning("RealtimeTTS attempt %d failed: %s", attempt, e)
+            if attempt < max_retries:
+                wait_time = min(60, 30 + (attempt * 5))
+                logger.warning("Waiting %ds before next retry...", wait_time)
+                time.sleep(wait_time)
+            continue
 
-            last_error = (stderr or stdout or "edge-tts lỗi").strip()
-            if os.path.exists(audio_path):
-                os.remove(audio_path)
-        else:
-            raise RuntimeError(last_error)
-
-        if not os.path.exists(audio_path):
-            raise RuntimeError("edge-tts không tạo file audio")
-
-        with open(audio_path, "rb") as handle:
-            return handle.read()
-
-def clamp_controls(value: int, minimum: int, maximum: int) -> int:
-    return max(minimum, min(maximum, value))
+    raise RuntimeError(f"RealtimeTTS lỗi sau {max_retries} lần thử: {last_error}")
 
 
-def format_rate(value: int) -> str:
-    value = clamp_controls(value, -100, 100)
-    return f"{value:+d}%"
-
-
-def format_pitch(value: int) -> str:
-    value = clamp_controls(value, -100, 100)
-    return f"{value:+d}Hz"
+# ─── Session Management ───────────────────────────────────────────────────────
 
 
 @dataclass
 class RuntimeSession:
     id: str
     story_id: int
-    chapters: list[ChapterPayload]
+    chapters: list[RealtimeChapterPayload]
     current_index: int
     voice: str
     speed: int
@@ -259,13 +260,13 @@ class RuntimeSession:
     status: str = "pending"
     last_error: str = ""
     pending_index: int | None = None
-    loop: asyncio.AbstractEventLoop | None = None
-    outbox: asyncio.Queue[dict[str, Any]] | None = None
+    loop: Any = None
+    outbox: Any = None
     worker: threading.Thread | None = None
-    current_stream: Any | None = None
     stop_requested: threading.Event = field(default_factory=threading.Event)
-    closed: threading.Event = field(default_factory=threading.Event)
+    current_stream: Any = None
     lock: threading.RLock = field(default_factory=threading.RLock)
+    closed: threading.Event = field(default_factory=threading.Event)
 
     def to_response(self) -> SessionResponse:
         chapter = self.chapters[self.current_index]
@@ -281,7 +282,7 @@ class RuntimeSession:
             autoNext=self.auto_next,
         )
 
-    def attach(self, loop: asyncio.AbstractEventLoop, outbox: asyncio.Queue[dict[str, Any]]) -> None:
+    def attach(self, loop, outbox) -> None:
         with self.lock:
             self.loop = loop
             self.outbox = outbox
@@ -290,8 +291,13 @@ class RuntimeSession:
         with self.lock:
             if self.worker and self.worker.is_alive():
                 return
-            self.worker = threading.Thread(target=self._run, daemon=True, name=f"tts-session-{self.id}")
+            self.worker = threading.Thread(
+                target=self._run,
+                daemon=True,
+                name=f"tts-session-{self.id}"
+            )
             self.worker.start()
+            logger.info("Worker thread started for session %s", self.id)
 
     def stop(self) -> None:
         self.stop_requested.set()
@@ -308,9 +314,9 @@ class RuntimeSession:
             if controls.voice is not None and controls.voice.strip():
                 self.voice = controls.voice.strip()
             if controls.speed is not None:
-                self.speed = clamp_controls(controls.speed, -100, 100)
+                self.speed = max(-100, min(100, controls.speed))
             if controls.pitch is not None:
-                self.pitch = clamp_controls(controls.pitch, -120, 120)
+                self.pitch = max(-120, min(120, controls.pitch))
             if controls.autoNext is not None:
                 self.auto_next = controls.autoNext
 
@@ -339,31 +345,43 @@ class RuntimeSession:
     def emit_event(self, payload: dict[str, Any]) -> None:
         self.updated_at = now_iso()
         if not self.loop or not self.outbox:
+            logger.warning("Cannot emit event %s: loop=%s, outbox=%s",
+                         payload.get("type"), self.loop is not None, self.outbox is not None)
             return
-        asyncio.run_coroutine_threadsafe(self.outbox.put({"kind": "event", "payload": payload}), self.loop)
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self.outbox.put({"kind": "event", "payload": payload}),
+                self.loop
+            )
+        except Exception as e:
+            logger.error("Failed to emit event %s: %s", payload.get("type"), e)
 
     def emit_audio(self, payload: bytes) -> None:
         if not payload or not self.loop or not self.outbox:
             return
-        asyncio.run_coroutine_threadsafe(self.outbox.put({"kind": "audio", "payload": payload}), self.loop)
+        asyncio.run_coroutine_threadsafe(
+            self.outbox.put({"kind": "audio", "payload": payload}),
+            self.loop,
+        )
 
     def _run(self) -> None:
+        logger.info("Worker thread started for session %s", self.id)
         try:
             self.status = "streaming"
-            self.emit_event(
-                {
-                    "type": "session_started",
-                    "sessionId": self.id,
-                    "storyId": self.story_id,
-                    "chapterId": self.chapters[self.current_index].chapterId,
-                    "chapterIndex": self.chapters[self.current_index].chapterIndex,
-                    "voice": self.voice,
-                    "speed": self.speed,
-                    "pitch": self.pitch,
-                    "autoNext": self.auto_next,
-                }
-            )
-            self.emit_event({"type": "audio_format", "mime": "audio/mpeg"})
+            logger.info("Emitting session_started event for session %s", self.id)
+            self.emit_event({
+                "type": "session_started",
+                "sessionId": self.id,
+                "storyId": self.story_id,
+                "chapterId": self.chapters[self.current_index].chapterId,
+                "chapterIndex": self.chapters[self.current_index].chapterIndex,
+                "voice": self.voice,
+                "speed": self.speed,
+                "pitch": self.pitch,
+                "autoNext": self.auto_next,
+            })
+            self.emit_event({"type": "audio_format", "mime": "audio/wav"})
+            logger.info("Session %s setup complete, starting chapter loop", self.id)
 
             chapter_index = self.current_index
             while chapter_index < len(self.chapters):
@@ -379,16 +397,15 @@ class RuntimeSession:
                     self.current_index = chapter_index
 
                 chapter = self.chapters[chapter_index]
-                self.emit_event(
-                    {
-                        "type": "chapter_started",
-                        "sessionId": self.id,
-                        "storyId": self.story_id,
-                        "chapterId": chapter.chapterId,
-                        "chapterIndex": chapter.chapterIndex,
-                        "chapterTitle": chapter.title,
-                    }
-                )
+                logger.info("Starting chapter %d: %s", chapter.chapterIndex, chapter.title)
+                self.emit_event({
+                    "type": "chapter_started",
+                    "sessionId": self.id,
+                    "storyId": self.story_id,
+                    "chapterId": chapter.chapterId,
+                    "chapterIndex": chapter.chapterIndex,
+                    "chapterTitle": chapter.title,
+                })
 
                 interrupted = self._stream_chapter(chapter)
                 if self.stop_requested.is_set():
@@ -398,15 +415,13 @@ class RuntimeSession:
 
                 with self.lock:
                     if self.pending_index is not None:
-                        self.emit_event(
-                            {
-                                "type": "chapter_transition",
-                                "sessionId": self.id,
-                                "fromChapterId": chapter.chapterId,
-                                "toChapterId": self.chapters[self.pending_index].chapterId,
-                                "reason": "skip",
-                            }
-                        )
+                        self.emit_event({
+                            "type": "chapter_transition",
+                            "sessionId": self.id,
+                            "fromChapterId": chapter.chapterId,
+                            "toChapterId": self.chapters[self.pending_index].chapterId,
+                            "reason": "skip",
+                        })
                         chapter_index = self.pending_index
                         self.pending_index = None
                         continue
@@ -414,14 +429,12 @@ class RuntimeSession:
                 if interrupted:
                     continue
 
-                self.emit_event(
-                    {
-                        "type": "chapter_finished",
-                        "sessionId": self.id,
-                        "chapterId": chapter.chapterId,
-                        "chapterIndex": chapter.chapterIndex,
-                    }
-                )
+                self.emit_event({
+                    "type": "chapter_finished",
+                    "sessionId": self.id,
+                    "chapterId": chapter.chapterId,
+                    "chapterIndex": chapter.chapterIndex,
+                })
                 if not self.auto_next:
                     self.status = "stopped"
                     self.emit_event({"type": "stopped", "sessionId": self.id})
@@ -429,20 +442,23 @@ class RuntimeSession:
 
                 if chapter_index >= len(self.chapters) - 1:
                     self.status = "completed"
-                    self.emit_event({"type": "story_finished", "sessionId": self.id, "storyId": self.story_id})
+                    self.emit_event({
+                        "type": "story_finished",
+                        "sessionId": self.id,
+                        "storyId": self.story_id,
+                    })
                     break
 
                 next_chapter = self.chapters[chapter_index + 1]
-                self.emit_event(
-                    {
-                        "type": "chapter_transition",
-                        "sessionId": self.id,
-                        "fromChapterId": chapter.chapterId,
-                        "toChapterId": next_chapter.chapterId,
-                        "reason": "auto_next",
-                    }
-                )
+                self.emit_event({
+                    "type": "chapter_transition",
+                    "sessionId": self.id,
+                    "fromChapterId": chapter.chapterId,
+                    "toChapterId": next_chapter.chapterId,
+                    "reason": "auto_next",
+                })
                 chapter_index += 1
+
         except Exception as exc:
             logger.exception("RealtimeTTS session lỗi")
             self.status = "failed"
@@ -452,72 +468,163 @@ class RuntimeSession:
             self.closed.set()
             self.emit_event({"type": "stream_closed", "sessionId": self.id, "status": self.status})
 
-    def _stream_chapter(self, chapter: ChapterPayload) -> bool:
-        segments = split_stream_segments(chapter.text)
-        if not segments:
+    def _stream_chapter(self, chapter: RealtimeChapterPayload) -> bool:
+        # Chia chapter thành nhiều đoạn nhỏ
+        large_chunks = split_chapter_into_chunks(chapter.text, num_chunks=20)
+        if not large_chunks:
             return False
 
-        last_error: Exception | None = None
-        for attempt in range(1, 4):
-            try:
-                interrupted = False
-                for segment in segments:
-                    prepared_segment = prepare_tts_segment(segment)
-                    if not prepared_segment:
-                        continue
+        logger.info("Chapter %d split into %d chunks for sequential synthesis",
+                   chapter.chapterIndex, len(large_chunks))
 
-                    with self.lock:
-                        current_voice = self.voice
-                        current_speed = self.speed
-                        current_pitch = self.pitch
-                        pending_index = self.pending_index
+        chunk_failures = 0
+        max_chunk_failures = max(3, len(large_chunks) // 3)
 
-                    if self.stop_requested.is_set() or pending_index is not None:
-                        interrupted = True
-                        break
+        interrupted = False
+        chunk_index = 0
+        successful_chunks = 0
 
-                    audio_bytes = synthesize_segment_with_edge_cli(
-                        prepared_segment,
-                        current_voice,
-                        current_speed,
-                        current_pitch,
-                        self,
-                    )
-                    if not audio_bytes:
-                        continue
+        for chunk in large_chunks:
+            prepared_chunk = prepare_tts_segment(chunk)
+            if not prepared_chunk:
+                chunk_index += 1
+                continue
 
-                    for offset in range(0, len(audio_bytes), 32 * 1024):
+            with self.lock:
+                current_voice = self.voice
+                current_speed = self.speed
+                current_pitch = self.pitch
+                pending_index = self.pending_index
+
+            if self.stop_requested.is_set() or pending_index is not None:
+                interrupted = True
+                break
+
+            # Chia chunk thành sub-segments cho highlighting
+            sub_segments = split_into_segments(prepared_chunk, max_chars=600)
+
+            logger.info("Synthesizing chunk %d/%d (%d chars, %d segments)",
+                       chunk_index + 1, len(large_chunks), len(prepared_chunk), len(sub_segments))
+
+            self.emit_event({
+                "type": "chunk_started",
+                "sessionId": self.id,
+                "chunkIndex": chunk_index,
+                "totalChunks": len(large_chunks),
+            })
+
+            # Tổng hợp chunk với RealtimeTTS (stream real-time)
+            total_bytes = 0
+            estimated_duration = 0.0
+            retry_count = 0
+
+            while total_bytes == 0:
+                if retry_count > 0:
+                    wait_time = min(60, 30 + (retry_count * 3))
+                    logger.warning("Chunk %d failed (attempt #%d), waiting %ds before retry...",
+                                 chunk_index, retry_count, wait_time)
+
+                    wait_start = time.time()
+                    while time.time() - wait_start < wait_time:
                         if self.stop_requested.is_set():
+                            logger.info("Stop requested during retry wait for chunk %d", chunk_index)
                             interrupted = True
                             break
                         with self.lock:
                             if self.pending_index is not None:
+                                logger.info("Pending index changed during retry wait for chunk %d", chunk_index)
                                 interrupted = True
                                 break
-                        self.emit_audio(audio_bytes[offset : offset + 32 * 1024])
+                        time.sleep(1)
 
                     if interrupted:
                         break
 
-                    with self.lock:
-                        self.current_stream = None
+                try:
+                    def on_audio_chunk_callback(chunk: bytes):
+                        nonlocal total_bytes
+                        total_bytes += len(chunk)
+                        self.emit_audio(chunk)
 
-                return interrupted
-            except Exception as exc:
-                last_error = exc
-                logger.warning("Retry realtime chapter %s lần %s do lỗi: %s", chapter.chapterId, attempt, exc)
+                    total_bytes, estimated_duration = synthesize_chunk_realtime(
+                        prepared_chunk,
+                        current_voice,
+                        current_speed,
+                        current_pitch,
+                        self,
+                        on_audio_chunk_callback,
+                        max_retries=3,
+                    )
+                except Exception as e:
+                    retry_count += 1
+                    logger.error("Chunk %d synthesis failed (retry #%d): %s", chunk_index, retry_count, e)
+                    continue
+
+            if interrupted:
+                break
+
+            if total_bytes == 0:
+                logger.warning("Chunk %d synthesis returned empty audio", chunk_index)
+                chunk_failures += 1
+                chunk_index += 1
+                continue
+
+            successful_chunks += 1
+            logger.info("Chunk %d synthesized successfully (%d bytes, %.1fs) after %d retries",
+                       chunk_index, total_bytes, estimated_duration, retry_count)
+
+            # Tính timing cho segment events
+            seconds_per_sub = estimated_duration / max(len(sub_segments), 1)
+            BUFFER_DELAY_SEC = 1.0  # RealtimeTTS stream real-time nên buffer ít hơn
+            effective_start_time = time.time() + BUFFER_DELAY_SEC
+
+            logger.info("Chunk %d: %d bytes, estimated %.1fs (%.2fs per segment, speed=%.0f%%)",
+                       chunk_index, total_bytes, estimated_duration, seconds_per_sub, current_speed)
+
+            # Emit segment events với delay đồng bộ playback
+            sub_index = 0
+            for sub_idx in range(len(sub_segments)):
+                emit_time = effective_start_time + (sub_idx * seconds_per_sub)
+                wait_sec = emit_time - time.time()
+
+                if wait_sec > 0:
+                    time.sleep(wait_sec)
+
                 if self.stop_requested.is_set():
-                    return True
+                    interrupted = True
+                    break
                 with self.lock:
                     if self.pending_index is not None:
-                        return True
-                if attempt < 3:
-                    time.sleep(1.2 * attempt)
-                    continue
-            finally:
+                        interrupted = True
+                        break
+
+                sub_index = sub_idx
+                self.emit_event({
+                    "type": "segment_started",
+                    "sessionId": self.id,
+                    "segmentIndex": sub_index,
+                    "totalSegments": len(sub_segments),
+                    "chunkIndex": chunk_index,
+                    "segmentText": sub_segments[sub_index][:200],
+                })
+
+            if interrupted:
+                break
+
+            with self.lock:
                 self.current_stream = None
 
-        raise RuntimeError(str(last_error) if last_error else f"RealtimeTTS không tạo được audio cho chương {chapter.chapterIndex}")
+            self.emit_event({
+                "type": "chunk_finished",
+                "sessionId": self.id,
+                "chunkIndex": chunk_index,
+            })
+
+            chunk_index += 1
+
+        logger.info("Chapter %d finished: %d/%d chunks successful, %d failed",
+                   chapter.chapterIndex, successful_chunks, len(large_chunks), chunk_failures)
+        return interrupted
 
 
 class SessionRegistry:
@@ -530,7 +637,10 @@ class SessionRegistry:
             raise HTTPException(status_code=400, detail="Danh sách chương trống")
 
         try:
-            current_index = next(index for index, item in enumerate(request.chapters) if item.chapterId == request.chapterId)
+            current_index = next(
+                index for index, item in enumerate(request.chapters)
+                if item.chapterId == request.chapterId
+            )
         except StopIteration as exc:
             raise HTTPException(status_code=400, detail="Không tìm thấy chapterId trong danh sách chương") from exc
 
@@ -539,7 +649,7 @@ class SessionRegistry:
             story_id=request.storyId,
             chapters=request.chapters,
             current_index=current_index,
-            voice=request.voice or DEFAULT_VOICE,
+            voice=request.voice or "vi-VN-NamMinhNeural",
             speed=request.speed,
             pitch=request.pitch,
             auto_next=request.autoNext,
@@ -559,96 +669,102 @@ class SessionRegistry:
         with self._lock:
             total = len(self._items)
             active = sum(1 for item in self._items.values() if item.status in {"pending", "streaming"})
-        return {"totalSessions": total, "activeSessions": active}
+            items = [item.to_response() for item in self._items.values()]
+        return {"total": total, "active": active, "items": items}
+
+    def remove(self, session_id: str) -> None:
+        with self._lock:
+            session = self._items.pop(session_id, None)
+        if session:
+            session.stop()
 
 
-app = FastAPI(title="story-tts-realtime")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ─── App State ────────────────────────────────────────────────────────────────
+
 
 registry = SessionRegistry()
 
+DEFAULT_VOICE = "vi-VN-NamMinhNeural"
 
-@app.get("/health")
-async def health() -> dict[str, Any]:
-    return {"status": "ok", "service": "story-tts-realtime", "host": DEFAULT_HOST, "port": DEFAULT_PORT, **registry.snapshot()}
+VIETNAMESE_VOICES = [
+    RealtimeVoice(id="vi-VN-HoaiMyNeural", name="vi-VN-HoaiMyNeural", locale="vi-VN", gender="Female", friendlyName="Microsoft HoaiMy Online (Natural) - Vietnamese"),
+    RealtimeVoice(id="vi-VN-NamMinhNeural", name="vi-VN-NamMinhNeural", locale="vi-VN", gender="Male", friendlyName="Microsoft NamMinh Online (Natural) - Vietnamese"),
+]
+
+
+# ─── API Routes ───────────────────────────────────────────────────────────────
 
 
 @app.get("/voices")
-async def voices() -> dict[str, Any]:
-    items = []
-    for voice in await edge_tts.list_voices():
-        items.append(
-            {
-                "id": voice["ShortName"],
-                "name": voice["ShortName"],
-                "locale": voice["Locale"],
-                "gender": voice.get("Gender", ""),
-                "friendlyName": voice.get("FriendlyName") or voice["ShortName"],
-            }
-        )
-    items.sort(key=lambda item: (item["locale"], item["friendlyName"]))
-    return {"items": items, "defaultVoice": DEFAULT_VOICE}
+def list_voices() -> dict[str, Any]:
+    return {"items": VIETNAMESE_VOICES, "defaultVoice": DEFAULT_VOICE}
 
 
-@app.post("/sessions", response_model=SessionResponse)
-async def create_session(request: CreateSessionRequest) -> SessionResponse:
+@app.post("/sessions")
+def create_session(request: CreateSessionRequest) -> SessionResponse:
     session = registry.create(request)
     return session.to_response()
 
 
-@app.post("/sessions/{session_id}/stop")
-async def stop_session(session_id: str) -> dict[str, str]:
-    session = registry.get(session_id)
-    session.stop()
-    return {"status": "stopping", "id": session_id}
-
-
-@app.post("/sessions/{session_id}/skip-next")
-async def skip_next(session_id: str) -> dict[str, str]:
-    session = registry.get(session_id)
-    session.skip(1)
-    return {"status": "skipping", "direction": "next", "id": session_id}
-
-
-@app.post("/sessions/{session_id}/skip-prev")
-async def skip_prev(session_id: str) -> dict[str, str]:
-    session = registry.get(session_id)
-    session.skip(-1)
-    return {"status": "skipping", "direction": "prev", "id": session_id}
-
-
-@app.post("/sessions/{session_id}/controls", response_model=SessionResponse)
-async def update_controls(session_id: str, request: UpdateSessionControlsRequest) -> SessionResponse:
-    session = registry.get(session_id)
-    return session.update_controls(request)
+@app.get("/sessions")
+def list_sessions() -> dict[str, Any]:
+    return registry.snapshot()
 
 
 @app.websocket("/sessions/{session_id}/stream")
-async def stream_session(websocket: WebSocket, session_id: str) -> None:
+async def stream_session(session_id: str, websocket: WebSocket):
     await websocket.accept()
     session = registry.get(session_id)
-    outbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    outbox: asyncio.Queue = asyncio.Queue()
     session.attach(asyncio.get_running_loop(), outbox)
     session.start()
 
     try:
         while True:
-            item = await outbox.get()
-            if item["kind"] == "event":
-                await websocket.send_json(item["payload"])
-                if item["payload"].get("type") == "stream_closed":
-                    break
-            else:
-                await websocket.send_bytes(item["payload"])
+            message = await outbox.get()
+            if message["kind"] == "event":
+                await websocket.send_json(message["payload"])
+            elif message["kind"] == "audio":
+                await websocket.send_bytes(message["payload"])
     except WebSocketDisconnect:
-        logger.info("WebSocket session %s đã ngắt kết nối", session_id)
-        session.stop()
+        logger.info("WebSocket disconnected for session %s", session_id)
+    except Exception as e:
+        logger.exception("WebSocket error for session %s: %s", session_id, e)
     finally:
-        with contextlib.suppress(Exception):
-            await websocket.close()
+        session.stop()
+
+
+@app.post("/sessions/{session_id}/stop")
+def stop_session(session_id: str) -> dict[str, str]:
+    session = registry.get(session_id)
+    session.stop()
+    return {"status": "stopped", "id": session_id}
+
+
+@app.post("/sessions/{session_id}/skip-next")
+def skip_next(session_id: str) -> dict[str, str]:
+    session = registry.get(session_id)
+    session.skip(1)
+    return {"status": "skipped", "id": session_id}
+
+
+@app.post("/sessions/{session_id}/skip-prev")
+def skip_prev(session_id: str) -> dict[str, str]:
+    session = registry.get(session_id)
+    session.skip(-1)
+    return {"status": "skipped", "id": session_id}
+
+
+@app.post("/sessions/{session_id}/controls")
+def update_controls(session_id: str, controls: UpdateSessionControlsRequest) -> SessionResponse:
+    session = registry.get(session_id)
+    return session.update_controls(controls)
+
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8010, log_level="info")

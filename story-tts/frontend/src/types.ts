@@ -158,16 +158,19 @@ export interface RealtimeSession {
 
 export interface RealtimeSessionState {
   type:
-    | 'session_started'
-    | 'controls_updated'
-    | 'audio_format'
-    | 'chapter_started'
-    | 'chapter_finished'
-    | 'chapter_transition'
-    | 'story_finished'
-    | 'stopped'
-    | 'error'
-    | 'stream_closed'
+  | 'session_started'
+  | 'controls_updated'
+  | 'audio_format'
+  | 'chunk_started'
+  | 'chunk_finished'
+  | 'segment_started'
+  | 'chapter_started'
+  | 'chapter_finished'
+  | 'chapter_transition'
+  | 'story_finished'
+  | 'stopped'
+  | 'error'
+  | 'stream_closed'
   sessionId?: string
   storyId?: number
   chapterId?: number
@@ -175,6 +178,12 @@ export interface RealtimeSessionState {
   chapterTitle?: string
   fromChapterId?: number
   toChapterId?: number
+  chunkIndex?: number
+  totalChunks?: number
+  chunkText?: string
+  segmentIndex?: number
+  totalSegments?: number
+  segmentText?: string
   voice?: string
   speed?: number
   pitch?: number

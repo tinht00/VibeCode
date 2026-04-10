@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"golang.org/x/text/encoding/charmap"
@@ -54,11 +55,7 @@ func ParseChapterFile(path string) (ParsedChapter, error) {
 
 func ParseChapterContent(title string, raw []byte, sourcePath string) ParsedChapter {
 	text := decodeText(raw)
-	text = strings.TrimPrefix(text, "\ufeff")
-	text = strings.ReplaceAll(text, "\r\n", "\n")
-	text = strings.ReplaceAll(text, "\r", "\n")
-	text = whitespaceRe.ReplaceAllString(text, "\n\n")
-	text = strings.TrimSpace(text)
+	text = NormalizeChapterText(text)
 
 	sum := sha1.Sum([]byte(text))
 
@@ -68,6 +65,27 @@ func ParseChapterContent(title string, raw []byte, sourcePath string) ParsedChap
 		NormalizedText: text,
 		Checksum:       hex.EncodeToString(sum[:]),
 	}
+}
+
+func NormalizeChapterText(text string) string {
+	text = strings.TrimPrefix(text, "\ufeff")
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	text = stripTrailingDotsPerLine(text)
+	text = whitespaceRe.ReplaceAllString(text, "\n\n")
+	return strings.TrimSpace(text)
+}
+
+func stripTrailingDotsPerLine(text string) string {
+	lines := strings.Split(text, "\n")
+	for index, line := range lines {
+		trimmed := strings.TrimRightFunc(line, unicode.IsSpace)
+		if strings.HasSuffix(trimmed, ".") && !strings.HasSuffix(trimmed, "..") {
+			trimmed = strings.TrimSuffix(trimmed, ".")
+		}
+		lines[index] = trimmed
+	}
+	return strings.Join(lines, "\n")
 }
 
 func ToModelChapter(storyID int64, index int, libraryFilePath string, parsed ParsedChapter, preset model.ProsodyPreset) model.Chapter {

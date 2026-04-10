@@ -12,6 +12,7 @@
 - `frontend/`: UI reader 3 cột, folder picker, danh sách truyện/chương, audio player và khôi phục tiến độ
 
 ## 3. Lệnh và điểm vào quan trọng
+- Local launcher: `.\run.ps1`
 - Backend dev: `go run ./cmd/api`
 - TTS service dev: `data/run/tts-venv/Scripts/python.exe -m uvicorn tts_service.app:app --host 127.0.0.1 --port 8010`
 - Backend build: `go build ./...`

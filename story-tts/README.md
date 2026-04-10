@@ -55,6 +55,22 @@ Copy-Item .env.example .env
 go run ./cmd/api
 ```
 
+### Chạy local bằng một lệnh
+```powershell
+cd D:\Tinht00_Workspace\VibeCode\story-tts
+.\run.ps1
+```
+
+Script này sẽ:
+- in ra URL và cổng hiện tại của frontend, backend và realtime TTS
+- tự copy `backend/.env` từ `.env.example` nếu file chưa có
+- mở 3 cửa sổ PowerShell riêng để chạy `tts_service`, `backend` và `frontend`
+
+Nếu chỉ muốn kiểm tra cấu hình cổng mà chưa mở terminal mới:
+```powershell
+.\run.ps1 -DryRun
+```
+
 ### Realtime TTS Service
 ```powershell
 cd D:\Tinht00_Workspace\VibeCode\story-tts

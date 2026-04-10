@@ -310,6 +310,7 @@ func (m *Manager) GetChapterContent(ctx context.Context, chapterID int64) (model
 	if err != nil {
 		return model.ChapterContent{}, err
 	}
+	text := library.NormalizeChapterText(chapter.NormalizedText)
 
 	return model.ChapterContent{
 		StoryID:        story.ID,
@@ -317,8 +318,8 @@ func (m *Manager) GetChapterContent(ctx context.Context, chapterID int64) (model
 		ChapterIndex:   chapter.ChapterIndex,
 		StoryTitle:     story.Title,
 		ChapterTitle:   chapter.Title,
-		Text:           chapter.NormalizedText,
-		CharacterCount: len([]rune(chapter.NormalizedText)),
+		Text:           text,
+		CharacterCount: len([]rune(text)),
 		UpdatedAt:      chapter.UpdatedAt,
 	}, nil
 }
@@ -1092,9 +1093,8 @@ func sanitizeTTSInput(text string) string {
 
 	text = norm.NFC.String(text)
 	text = strings.ReplaceAll(text, "\u00a0", " ")
-	text = strings.ReplaceAll(text, "\r\n", "\n")
-	text = strings.ReplaceAll(text, "\r", "\n")
-	text = ttsDividerRe.ReplaceAllString(text, ". ")
+	text = library.NormalizeChapterText(text)
+	text = ttsDividerRe.ReplaceAllString(text, " ")
 	text = strings.Map(func(r rune) rune {
 		switch {
 		case r == '\n' || r == '\t':
