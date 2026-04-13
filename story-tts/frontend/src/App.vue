@@ -9,6 +9,7 @@ import type {
   ProsodyPreset,
   ReaderProgress,
   RealtimeChapterPayload,
+  RealtimeSegmentItem,
   RealtimeSession,
   RealtimeSessionState,
   RealtimeVoice,
@@ -54,6 +55,38 @@ type LoadChapterOptions = {
 }
 
 type RealtimeStatus = 'idle' | 'connecting' | 'buffering' | 'reading' | 'transitioning' | 'stopped' | 'finished' | 'error'
+type RealtimeSegmentStatus = 'queued' | 'rendering' | 'retrying' | 'ready' | 'reading' | 'played'
+type RealtimeSegmentState = {
+  index: number
+  text: string
+  wordCount: number
+  status: RealtimeSegmentStatus
+  attempt: number
+  message: string
+  durationEstimate: number
+}
+type RealtimeChapterSegmentGroup = {
+  chapterId: number
+  chapterIndex: number
+  chapterTitle: string
+  status: 'queued' | 'rendering' | 'reading' | 'completed'
+  startSegmentIndex: number
+  segments: RealtimeSegmentState[]
+}
+type RealtimePlaybackCursor = {
+  chapterId: number
+  segmentIndex: number
+  audioTimeAtStart: number
+}
+type ReaderInlineToken = {
+  key: string
+  text: string
+  isWord: boolean
+  wordIndex: number | null
+}
+type ReaderRenderableBlock = ReaderBlock & {
+  tokens: ReaderInlineToken[]
+}
 
 const presets: ProsodyPreset[] = ['stable', 'gentle', 'tense', 'climax']
 const handleDbName = 'story-tts-reader'
@@ -85,6 +118,8 @@ const realtimeCurrentChapterTitle = ref('')
 const realtimeError = ref('')
 const realtimeServiceError = ref('')
 const realtimeConnecting = ref(false)
+const realtimeChapterGroups = ref<RealtimeChapterSegmentGroup[]>([])
+const realtimePlaybackCursor = ref<RealtimePlaybackCursor | null>(null)
 const useEdgeReadAloud = ref(false)
 const edgeReadAloudActive = ref(false)
 const edgeReadAloudWordsPerMinute = ref(185)
@@ -113,7 +148,6 @@ let pendingMediaEnd = false
 let userPausedAudio = false
 let edgeReadAloudTimer: number | null = null
 const activeTab = ref<'library' | 'reader'>('library')
-const activeReadingBlockIndex = ref(-1)
 const shouldAutoScroll = ref(false)  // Chỉ scroll khi user đã scroll thủ công
 let userHasScrolled = false
 const audioCurrentTime = ref(0)
@@ -144,7 +178,6 @@ const chapterWordCount = computed(() => {
   if (!chapterContent.value?.text) return 0
   return chapterContent.value.text.split(/\s+/).filter(Boolean).length
 })
-const showLegacyReadingHighlight = computed(() => !useEdgeReadAloud.value)
 const isEdgeBrowser = computed(() => /Edg\//.test(window.navigator.userAgent))
 
 const canRefreshLibrary = computed(() => Boolean(currentDirectoryHandle.value) || stories.value.length === 0)
@@ -169,6 +202,72 @@ const realtimeVoiceOptions = computed(() =>
 const currentVoiceLabel = computed(() => {
   const matched = realtimeVoiceOptions.value.find((voice) => voice.id === selectedVoice.value)
   return matched?.friendlyName ?? selectedVoice.value ?? ''
+})
+
+const sortedRealtimeChapterGroups = computed(() =>
+  [...realtimeChapterGroups.value].sort((left, right) => left.chapterIndex - right.chapterIndex)
+)
+
+const selectedRealtimeChapterGroup = computed(() => {
+  const chapterId = selectedChapterId.value
+  if (chapterId === null) return null
+  return sortedRealtimeChapterGroups.value.find((group) => group.chapterId === chapterId) ?? null
+})
+
+const realtimeSegmentMetrics = computed(() => {
+  const segments = sortedRealtimeChapterGroups.value.flatMap((group) => group.segments)
+  const total = segments.length
+  const played = segments.filter((segment) => segment.status === 'played').length
+  const ready = segments.filter((segment) => segment.status === 'ready').length
+  const rendering = segments.filter((segment) => ['rendering', 'retrying'].includes(segment.status)).length
+  const reading = segments.filter((segment) => segment.status === 'reading').length
+  return { total, played, ready, rendering, reading }
+})
+
+const renderableChapterBlocks = computed<ReaderRenderableBlock[]>(() => {
+  let wordIndex = 0
+  return formattedChapterBlocks.value.map((block, blockIndex) => {
+    if (block.kind === 'spacer') {
+      return { ...block, tokens: [] }
+    }
+
+    const parts = block.text.match(/\S+|\s+/g) ?? []
+    const tokens = parts.map((part, tokenIndex) => {
+      const isWord = /\S/.test(part)
+      const token: ReaderInlineToken = {
+        key: `${blockIndex}-${tokenIndex}-${isWord ? wordIndex : 'space'}`,
+        text: part,
+        isWord,
+        wordIndex: isWord ? wordIndex : null
+      }
+      if (isWord) {
+        wordIndex += 1
+      }
+      return token
+    })
+    return { ...block, tokens }
+  })
+})
+
+const activeWordGlobalIndex = computed<number | null>(() => {
+  const playback = realtimePlaybackCursor.value
+  const group = selectedRealtimeChapterGroup.value
+  if (!playback || !group || playback.chapterId !== group.chapterId) return null
+
+  const targetSegment = group.segments.find((segment) => segment.index === playback.segmentIndex)
+  if (!targetSegment || targetSegment.wordCount <= 0) return null
+
+  let startWord = 0
+  for (const segment of group.segments) {
+    if (segment.index === playback.segmentIndex) break
+    startWord += segment.wordCount
+  }
+
+  const duration = Math.max(targetSegment.durationEstimate || 0, 0.4)
+  const elapsed = Math.max(0, audioCurrentTime.value - playback.audioTimeAtStart)
+  const progress = Math.min(0.999, elapsed / duration)
+  const offset = Math.min(targetSegment.wordCount - 1, Math.floor(progress * targetSegment.wordCount))
+  return startWord + offset
 })
 
 const realtimeStatusLabel = computed(() => {
@@ -239,6 +338,163 @@ function formatDuration(seconds: number) {
   const mins = Math.floor(seconds / 60)
   const secs = Math.floor(seconds % 60)
   return `${mins}:${secs.toString().padStart(2, '0')}`
+}
+
+function resetRealtimeSegments() {
+  realtimeChapterGroups.value = []
+  realtimePlaybackCursor.value = null
+}
+
+function buildRealtimeSegmentState(item: RealtimeSegmentItem): RealtimeSegmentState {
+  return {
+    index: item.index,
+    text: item.text,
+    wordCount: item.wordCount ?? item.text.split(/\s+/).filter(Boolean).length,
+    status: 'queued',
+    attempt: 1,
+    message: '',
+    durationEstimate: item.durationEstimate ?? 0
+  }
+}
+
+function ensureRealtimeChapterGroup(
+  chapterId: number,
+  chapterIndex?: number,
+  chapterTitle?: string
+) {
+  const found = realtimeChapterGroups.value.find((group) => group.chapterId === chapterId)
+  if (found) return found
+
+  const fallback: RealtimeChapterSegmentGroup = {
+    chapterId,
+    chapterIndex: chapterIndex ?? 0,
+    chapterTitle: chapterTitle ?? `Chương ${chapterIndex ?? ''}`.trim(),
+    status: 'queued',
+    startSegmentIndex: 0,
+    segments: []
+  }
+  realtimeChapterGroups.value = [...realtimeChapterGroups.value, fallback]
+  return realtimeChapterGroups.value.find((group) => group.chapterId === chapterId) ?? fallback
+}
+
+function ensureRealtimeSegment(
+  chapterId: number,
+  index: number,
+  totalSegments?: number
+) {
+  const group = ensureRealtimeChapterGroup(chapterId)
+  const found = group.segments.find((segment) => segment.index === index)
+  if (found) return found
+
+  const fallback: RealtimeSegmentState = {
+    index,
+    text: totalSegments ? `Segment ${index + 1}/${totalSegments}` : `Segment ${index + 1}`,
+    wordCount: 0,
+    status: 'queued',
+    attempt: 1,
+    message: '',
+    durationEstimate: 0
+  }
+  realtimeChapterGroups.value = realtimeChapterGroups.value.map((item) =>
+    item.chapterId === chapterId
+      ? { ...item, segments: [...item.segments, fallback].sort((left, right) => left.index - right.index) }
+      : item
+  )
+  return ensureRealtimeChapterGroup(chapterId).segments.find((segment) => segment.index === index) ?? fallback
+}
+
+function patchRealtimeChapterGroup(chapterId: number, patch: Partial<RealtimeChapterSegmentGroup>) {
+  const current = ensureRealtimeChapterGroup(chapterId, patch.chapterIndex, patch.chapterTitle)
+  realtimeChapterGroups.value = realtimeChapterGroups.value.map((group) =>
+    group.chapterId === chapterId ? { ...current, ...patch } : group
+  )
+}
+
+function rewindRealtimeChapterFromSegment(chapterId: number, segmentIndex: number) {
+  realtimeChapterGroups.value = realtimeChapterGroups.value.map((group) =>
+    group.chapterId === chapterId
+      ? {
+          ...group,
+          startSegmentIndex: segmentIndex,
+          segments: group.segments.map((segment) =>
+            segment.index >= segmentIndex && segment.status === 'played'
+              ? { ...segment, status: 'ready', message: '' }
+              : segment
+          )
+        }
+      : group
+  )
+}
+
+function patchRealtimeSegment(
+  chapterId: number,
+  index: number,
+  patch: Partial<RealtimeSegmentState>,
+  totalSegments?: number
+) {
+  const current = ensureRealtimeSegment(chapterId, index, totalSegments)
+  realtimeChapterGroups.value = realtimeChapterGroups.value.map((group) =>
+    group.chapterId === chapterId
+      ? {
+          ...group,
+          segments: group.segments
+            .map((segment) => (segment.index === index ? { ...current, ...patch } : segment))
+            .sort((left, right) => left.index - right.index)
+        }
+      : group
+  )
+}
+
+function syncRealtimeSegments(
+  chapterId: number,
+  chapterIndex: number,
+  chapterTitle: string,
+  items: RealtimeSegmentItem[],
+  startSegmentIndex = 0
+) {
+  const current = ensureRealtimeChapterGroup(chapterId, chapterIndex, chapterTitle)
+  const existingByIndex = new Map(current.segments.map((segment) => [segment.index, segment]))
+  realtimeChapterGroups.value = realtimeChapterGroups.value.map((group) =>
+    group.chapterId === chapterId
+      ? {
+          ...current,
+          chapterIndex,
+          chapterTitle,
+          startSegmentIndex,
+          status: group.status === 'completed' ? 'completed' : current.status,
+          segments: items
+            .map((item) => {
+              const existing = existingByIndex.get(item.index)
+              return existing
+                ? {
+                    ...existing,
+                    text: item.text,
+                    wordCount: item.wordCount ?? existing.wordCount,
+                    durationEstimate: item.durationEstimate ?? existing.durationEstimate
+                  }
+                : buildRealtimeSegmentState(item)
+            })
+            .sort((left, right) => left.index - right.index)
+        }
+      : group
+  )
+}
+
+function realtimeSegmentStatusLabel(status: RealtimeSegmentStatus) {
+  switch (status) {
+    case 'rendering':
+      return 'Đang tạo'
+    case 'retrying':
+      return 'Đang retry'
+    case 'ready':
+      return 'Sẵn sàng'
+    case 'reading':
+      return 'Đang đọc'
+    case 'played':
+      return 'Đã đọc'
+    default:
+      return 'Đã tách'
+  }
 }
 
 function collateNatural(left: string, right: string) {
@@ -992,7 +1248,6 @@ async function startEdgeReadAloudPlayback() {
   if (!prepared) return
   error.value = ''
   edgeReadAloudActive.value = true
-  activeReadingBlockIndex.value = -1
   await sendEdgeReadAloudHotkey()
   scheduleEdgeReadAloudAutoNext()
 }
@@ -1001,7 +1256,6 @@ async function stopEdgeReadAloudPlayback() {
   clearEdgeReadAloudTimer()
   if (!edgeReadAloudActive.value) return
   edgeReadAloudActive.value = false
-  activeReadingBlockIndex.value = -1
   await sendEdgeReadAloudHotkey()
 }
 
@@ -1011,7 +1265,6 @@ function handleTimeUpdate() {
     audioDuration.value = audioRef.value.duration
   }
   scheduleProgressSave()
-  updateActiveReadingBlock()
 }
 
 function togglePlayback() {
@@ -1049,106 +1302,106 @@ function seekAudio(event: MouseEvent) {
   audioRef.value.currentTime = seekTime
 }
 
-function updateActiveReadingBlock() {
-  if (useEdgeReadAloud.value) {
-    activeReadingBlockIndex.value = -1
-    return
-  }
-  if (!audioRef.value || realtimeStatus.value === 'stopped' || !isRealtimeActive.value) {
-    activeReadingBlockIndex.value = -1
-    return
-  }
+function scrollActiveWordIntoView() {
+  if (!readerBody.value || activeWordGlobalIndex.value === null) return
+  const target = readerBody.value.querySelector<HTMLElement>(`[data-word-index="${activeWordGlobalIndex.value}"]`)
+  if (!target) return
 
-  const blocks = formattedChapterBlocks.value
-  if (blocks.length === 0) {
-    activeReadingBlockIndex.value = -1
-    return
-  }
-
-  const totalChars = blocks.reduce((sum, block) => sum + block.normalizedLength, 0)
-  let currentChars = 0
-
-  if (audioRef.value.duration && Number.isFinite(audioRef.value.duration) && audioRef.value.duration > 0 && totalChars > 0) {
-    const ratio = Math.min(1, Math.max(0, audioRef.value.currentTime / audioRef.value.duration))
-    currentChars = ratio * totalChars
-  } else {
-    const speedRatio = 1 + (realtimeSpeed.value / 100)
-    const charsPerSecond = 22 * speedRatio
-    currentChars = audioRef.value.currentTime * charsPerSecond
-  }
-
-  let accumulated = 0
-  let targetIndex = -1
-
-  for (let i = 0; i < blocks.length; i++) {
-    const blockLength = blocks[i].normalizedLength
-    if (accumulated + blockLength >= currentChars) {
-      targetIndex = i
-      break
-    }
-    accumulated += blockLength
-  }
-
-  if (targetIndex === -1 && currentChars > 0 && blocks.length > 0) {
-    targetIndex = blocks.length - 1
-  }
-
-  if (activeReadingBlockIndex.value !== targetIndex) {
-    activeReadingBlockIndex.value = targetIndex
-    autoScrollToActiveBlock()
-  }
-}
-
-function autoScrollToActiveBlock() {
-  if (activeReadingBlockIndex.value === -1 || !readerBody.value) return
-  
-  const el = readerBody.value.children[activeReadingBlockIndex.value] as HTMLElement
-  if (!el) return
-  
-  // Chỉ scroll nếu block nằm ngoài viewport
-  const rect = el.getBoundingClientRect()
+  const rect = target.getBoundingClientRect()
   const containerRect = readerBody.value.getBoundingClientRect()
-  
-  const isVisible = rect.top >= containerRect.top && rect.bottom <= containerRect.bottom
+  const isVisible = rect.top >= containerRect.top + 24 && rect.bottom <= containerRect.bottom - 24
   if (!isVisible) {
-    // Scroll với offset để block không bị dính sát mép
-    el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    target.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' })
   }
 }
 
-function findBlockIndexByText(segmentText: string): number {
-  if (!segmentText || !formattedChapterBlocks.value.length) return -1
-  
-  // Lấy ~80 ký tự đầu của segment text (đủ để match với block)
-  const searchPrefix = segmentText.trim().slice(0, 80).toLowerCase()
-  if (!searchPrefix) return -1
-  
-  // Tìm block có text bắt đầu giống với segment text
-  for (let i = 0; i < formattedChapterBlocks.value.length; i++) {
-    const block = formattedChapterBlocks.value[i]
-    if (block.kind === 'spacer') continue
-    
-    const blockText = block.text.trim().toLowerCase()
-    if (!blockText) continue
-    
-    // Chỉ match khi block text tương đối ngắn và bắt đầu giống segment
-    // Điều này tránh match chunk dài với block ngắn
-    const minLen = Math.min(blockText.length, searchPrefix.length, 60)
-    if (minLen >= 20 && blockText.slice(0, minLen) === searchPrefix.slice(0, minLen)) {
-      return i
+function findSegmentIndexByWordOffset(group: RealtimeChapterSegmentGroup, wordOffset: number) {
+  let accumulated = 0
+  for (const segment of group.segments) {
+    const start = accumulated
+    const end = accumulated + segment.wordCount
+    if (wordOffset < end) {
+      return segment.index
     }
-    
-    // Nếu block text ngắn, kiểm tra chứa trong searchPrefix
-    if (blockText.length < 100 && searchPrefix.includes(blockText)) {
-      return i
-    }
+    accumulated = end
   }
-  
-  return -1
+  return group.startSegmentIndex
 }
 
-async function buildRealtimePayload() {
-  if (!selectedStory.value || !selectedChapter.value) {
+function getSelectionWordOffset() {
+  if (!readerScanContent.value) return null
+  const selection = window.getSelection()
+  if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return null
+
+  const range = selection.getRangeAt(0)
+  if (!readerScanContent.value.contains(range.startContainer)) return null
+
+  const prefix = document.createRange()
+  prefix.selectNodeContents(readerScanContent.value)
+  prefix.setEnd(range.startContainer, range.startOffset)
+  const textBefore = normalizeTtsText(prefix.toString())
+  if (!textBefore) return 0
+  return textBefore.split(/\s+/).filter(Boolean).length
+}
+
+async function jumpToRealtimeSegment(chapterId: number, segmentIndex: number) {
+  if (!selectedStory.value) return
+  const baseUrl = realtimeBaseUrl()
+  if (!baseUrl) return
+
+  if (selectedChapterId.value !== chapterId) {
+    await loadChapter(chapterId, null, { preservePlayback: true, skipPersist: true })
+  }
+
+  patchRealtimeChapterGroup(chapterId, { startSegmentIndex: segmentIndex })
+  rewindRealtimeChapterFromSegment(chapterId, segmentIndex)
+
+  const sessionId = realtimeSession.value?.id
+  if (sessionId && isRealtimeActive.value) {
+    try {
+      const updated = await api.seekRealtimeSession(baseUrl, sessionId, { chapterId, segmentIndex })
+      realtimeSession.value = updated
+      realtimeCurrentChapterId.value = chapterId
+      realtimeCurrentChapterTitle.value = selectedStory.value.chapters.find((chapter) => chapter.id === chapterId)?.title ?? realtimeCurrentChapterTitle.value
+      realtimePlaybackCursor.value = {
+        chapterId,
+        segmentIndex,
+        audioTimeAtStart: audioCurrentTime.value
+      }
+      return
+    } catch (err) {
+      realtimeServiceError.value = err instanceof Error ? err.message : String(err)
+    }
+  }
+
+  await startRealtimePlayback({ startChapterId: chapterId, startSegmentIndex: segmentIndex })
+}
+
+async function startRealtimeFromSelection() {
+  const chapterId = selectedChapterId.value
+  const group = selectedRealtimeChapterGroup.value
+  if (chapterId === null || !group) {
+    error.value = 'Chưa có segment realtime cho chương đang mở.'
+    return
+  }
+
+  const wordOffset = getSelectionWordOffset()
+  if (wordOffset === null) {
+    error.value = 'Hãy bôi chọn một đoạn trong khung đọc trước khi yêu cầu đọc tiếp từ đó.'
+    return
+  }
+
+  const targetSegmentIndex = findSegmentIndexByWordOffset(group, wordOffset)
+  await jumpToRealtimeSegment(chapterId, targetSegmentIndex)
+}
+
+async function buildRealtimePayload(options: { startChapterId?: number; startSegmentIndex?: number } = {}) {
+  if (!selectedStory.value) {
+    throw new Error('Chưa có chương để phát realtime')
+  }
+
+  const targetChapterId = options.startChapterId ?? selectedChapter.value?.id
+  if (!targetChapterId) {
     throw new Error('Chưa có chương để phát realtime')
   }
 
@@ -1166,12 +1419,13 @@ async function buildRealtimePayload() {
 
   return {
     storyId: selectedStory.value.story.id,
-    chapterId: selectedChapter.value.id,
+    chapterId: targetChapterId,
     chapters,
     voice: selectedVoice.value,
     speed: realtimeSpeed.value,
     pitch: realtimePitch.value,
-    autoNext: true
+    autoNext: true,
+    startSegmentIndex: options.startSegmentIndex ?? 0
   }
 }
 
@@ -1186,7 +1440,7 @@ function websocketUrl(baseUrl: string, sessionId: string) {
   return url.toString()
 }
 
-async function startRealtimePlayback() {
+async function startRealtimePlayback(options: { startChapterId?: number; startSegmentIndex?: number } = {}) {
   if (!selectedStory.value || !selectedChapter.value) return
   const baseUrl = realtimeBaseUrl()
   if (!baseUrl) {
@@ -1209,13 +1463,14 @@ async function startRealtimePlayback() {
 
   try {
     await stopRealtimePlayback({ quiet: true, clearSession: true })
+    resetRealtimeSegments()
     realtimeStatus.value = 'connecting'
     await prepareRealtimeMediaStream()
-    const payload = await buildRealtimePayload()
+    const payload = await buildRealtimePayload(options)
     const session = await api.createRealtimeSession(baseUrl, payload)
     realtimeSession.value = session
-    realtimeCurrentChapterId.value = session.chapterId
-    realtimeCurrentChapterTitle.value = selectedChapter.value.title
+    realtimeCurrentChapterId.value = options.startChapterId ?? session.chapterId
+    realtimeCurrentChapterTitle.value = selectedStory.value.chapters.find((chapter) => chapter.id === (options.startChapterId ?? session.chapterId))?.title ?? selectedChapter.value.title
     isPlaybackActive = true  // Đánh dấu bắt đầu phiên playback
     connectRealtimeSocket(baseUrl, session.id)
   } catch (err) {
@@ -1304,6 +1559,7 @@ async function stopRealtimePlayback(options: { quiet?: boolean; clearSession?: b
 
   teardownRealtimeSocket()
   finishRealtimeStream()
+  resetRealtimeSegments()
   if (options.clearSession) {
     realtimeSession.value = null
     realtimeCurrentChapterId.value = null
@@ -1591,45 +1847,121 @@ function handleRealtimeEvent(event: RealtimeSessionState) {
     case 'session_started':
       realtimeStatus.value = 'buffering'
       realtimeError.value = ''
+      resetRealtimeSegments()
+      break
+    case 'chapter_segments':
+      if (typeof event.chapterId === 'number') {
+        syncRealtimeSegments(
+          event.chapterId,
+          event.chapterIndex ?? 0,
+          event.chapterTitle ?? `Chương ${event.chapterIndex ?? ''}`.trim(),
+          event.segments ?? [],
+          event.startSegmentIndex ?? 0
+        )
+      }
+      break
+    case 'segment_rendering':
+      if (typeof event.chapterId === 'number' && typeof event.segmentIndex === 'number') {
+        patchRealtimeChapterGroup(event.chapterId, {
+          chapterIndex: event.chapterIndex,
+          chapterTitle: event.chapterTitle,
+          status: 'rendering'
+        })
+        patchRealtimeSegment(event.chapterId, event.segmentIndex, {
+          status: 'rendering',
+          attempt: event.attempt ?? 1,
+          message: ''
+        }, event.totalSegments)
+      }
+      break
+    case 'segment_ready':
+      if (typeof event.chapterId === 'number' && typeof event.segmentIndex === 'number') {
+        patchRealtimeSegment(event.chapterId, event.segmentIndex, {
+          status: 'ready',
+          attempt: event.attempt ?? ensureRealtimeSegment(event.chapterId, event.segmentIndex, event.totalSegments).attempt,
+          message: '',
+          durationEstimate: event.durationEstimate ?? ensureRealtimeSegment(event.chapterId, event.segmentIndex, event.totalSegments).durationEstimate
+        }, event.totalSegments)
+      }
+      break
+    case 'segment_retry':
+      if (typeof event.chapterId === 'number' && typeof event.segmentIndex === 'number') {
+        patchRealtimeChapterGroup(event.chapterId, {
+          chapterIndex: event.chapterIndex,
+          chapterTitle: event.chapterTitle,
+          status: 'rendering'
+        })
+        patchRealtimeSegment(event.chapterId, event.segmentIndex, {
+          status: 'retrying',
+          attempt: event.attempt ?? ensureRealtimeSegment(event.chapterId, event.segmentIndex, event.totalSegments).attempt + 1,
+          message: event.message ?? 'Render lỗi, đang thử lại.'
+        }, event.totalSegments)
+      }
       break
     case 'segment_started':
-      // Highlight block khớp với sub-segment text đang được đọc
-      if (event.segmentText && showLegacyReadingHighlight.value) {
-        const targetIndex = findBlockIndexByText(event.segmentText)
-        if (targetIndex >= 0 && activeReadingBlockIndex.value !== targetIndex) {
-          activeReadingBlockIndex.value = targetIndex
-          // Chỉ scroll nếu user đã scroll thủ công trước đó
-          if (userHasScrolled) {
-            setTimeout(() => {
-              autoScrollToActiveBlock()
-            }, 300)
-          }
+      if (typeof event.chapterId === 'number' && typeof event.segmentIndex === 'number') {
+        realtimePlaybackCursor.value = {
+          chapterId: event.chapterId,
+          segmentIndex: event.segmentIndex,
+          audioTimeAtStart: audioCurrentTime.value
+        }
+        patchRealtimeChapterGroup(event.chapterId, {
+          chapterIndex: event.chapterIndex,
+          chapterTitle: event.chapterTitle,
+          status: 'reading'
+        })
+        patchRealtimeSegment(event.chapterId, event.segmentIndex, {
+          status: 'reading',
+          attempt: event.attempt ?? ensureRealtimeSegment(event.chapterId, event.segmentIndex, event.totalSegments).attempt,
+          message: '',
+          durationEstimate: event.durationEstimate ?? ensureRealtimeSegment(event.chapterId, event.segmentIndex, event.totalSegments).durationEstimate
+        }, event.totalSegments)
+      }
+      break
+    case 'segment_finished':
+      if (typeof event.chapterId === 'number' && typeof event.segmentIndex === 'number') {
+        patchRealtimeSegment(event.chapterId, event.segmentIndex, {
+          status: 'played',
+          message: ''
+        }, event.totalSegments)
+        if (realtimePlaybackCursor.value?.chapterId === event.chapterId && realtimePlaybackCursor.value?.segmentIndex === event.segmentIndex) {
+          realtimePlaybackCursor.value = null
         }
       }
       break
     case 'chunk_started':
-      break
     case 'chunk_finished':
       break
     case 'chapter_started':
       realtimeStatus.value = 'reading'
       realtimeCurrentChapterId.value = event.chapterId ?? null
       realtimeCurrentChapterTitle.value = event.chapterTitle ?? ''
-      // KHÔNG tự động bật auto-scroll - chỉ bật khi user scroll thủ công
-      // shouldAutoScroll.value sẽ được bật bởi scroll event listener
-      if (event.chapterId) {
-        void loadChapter(event.chapterId, null, { preservePlayback: true })
+      if (typeof event.chapterId === 'number') {
+        patchRealtimeChapterGroup(event.chapterId, {
+          chapterIndex: event.chapterIndex,
+          chapterTitle: event.chapterTitle,
+          status: 'reading'
+        })
+        if (selectedChapterId.value !== event.chapterId) {
+          void loadChapter(event.chapterId, null, { preservePlayback: true, skipPersist: true })
+        }
       }
       break
     case 'chapter_finished':
       realtimeStatus.value = 'transitioning'
+      realtimePlaybackCursor.value = null
+      if (typeof event.chapterId === 'number') {
+        patchRealtimeChapterGroup(event.chapterId, { status: 'completed' })
+      }
       void persistProgress(0)
       break
     case 'chapter_transition':
       realtimeStatus.value = 'transitioning'
+      realtimePlaybackCursor.value = null
       break
     case 'story_finished':
       realtimeStatus.value = 'finished'
+      realtimePlaybackCursor.value = null
       finishRealtimeStream()
       // Reset scroll flags khi kết thúc truyện
       shouldAutoScroll.value = false
@@ -1637,6 +1969,7 @@ function handleRealtimeEvent(event: RealtimeSessionState) {
       break
     case 'stopped':
       realtimeStatus.value = 'stopped'
+      realtimePlaybackCursor.value = null
       finishRealtimeStream()
       // Reset scroll flags khi dừng
       shouldAutoScroll.value = false
@@ -1646,10 +1979,12 @@ function handleRealtimeEvent(event: RealtimeSessionState) {
       if (!['finished', 'stopped', 'error'].includes(realtimeStatus.value)) {
         realtimeStatus.value = event.status === 'completed' ? 'finished' : 'stopped'
       }
+      realtimePlaybackCursor.value = null
       finishRealtimeStream()
       break
     case 'error':
       realtimeStatus.value = 'error'
+      realtimePlaybackCursor.value = null
       realtimeError.value = event.message || 'Realtime TTS gặp lỗi.'
       error.value = realtimeError.value
       finishRealtimeStream()
@@ -1726,6 +2061,14 @@ watch(edgeReadAloudWordsPerMinute, () => {
 watch(readerFontSize, () => {
   readerFontSize.value = clampReaderFontSize(readerFontSize.value)
   persistReaderPreferences()
+})
+
+watch(activeWordGlobalIndex, (nextWord, prevWord) => {
+  if (nextWord === null || nextWord === prevWord) return
+  if (!userHasScrolled) return
+  setTimeout(() => {
+    scrollActiveWordIntoView()
+  }, 40)
 })
 
 onMounted(() => {
@@ -1902,6 +2245,12 @@ onUnmounted(() => {
         >
           <div class="reader-layout" :class="{ 'edge-read-aloud-layout': useEdgeReadAloud }">
             <aside v-if="!useEdgeReadAloud" class="premium-player-column">
+              <div class="player-console-head">
+                <p class="eyebrow">Realtime Console</p>
+                <h3>{{ realtimeCurrentChapterTitle || chapterContent.chapterTitle }}</h3>
+                <p>{{ chapterContent.storyTitle }}</p>
+              </div>
+
               <div class="premium-player-card">
                 <div class="card-head">
                   <button class="card-head-icon nav-icon" @click="goToSiblingChapter(-1)" :disabled="!chapterAt(-1)">‹</button>
@@ -1947,6 +2296,11 @@ onUnmounted(() => {
                 <div class="player-info-block">
                   <h3 class="playing-title">{{ realtimeCurrentChapterTitle || chapterContent.chapterTitle }}</h3>
                   <p class="playing-subtitle">{{ chapterContent.storyTitle }}</p>
+                  <div class="player-status-row">
+                    <span class="player-status-pill" :class="`is-${realtimeStatus}`">{{ realtimeStatusLabel }}</span>
+                    <span class="player-voice-label">{{ currentVoiceLabel }}</span>
+                  </div>
+                  <p class="player-status-text">{{ realtimeStatusText }}</p>
                 </div>
 
                 <div class="player-main-controls">
@@ -1988,6 +2342,64 @@ onUnmounted(() => {
                   @play="userPausedAudio = false"
                 />
               </div>
+
+              <section v-if="sortedRealtimeChapterGroups.length" class="segment-status-card segment-status-card--main">
+                <div class="segment-status-head">
+                  <div>
+                    <p class="segment-status-kicker">Tiến trình segment</p>
+                    <strong>{{ realtimeSegmentMetrics.played }}/{{ realtimeSegmentMetrics.total }} đã đọc</strong>
+                  </div>
+                  <div class="segment-status-metrics">
+                    <span>{{ realtimeSegmentMetrics.rendering }} đang tạo</span>
+                    <span>{{ realtimeSegmentMetrics.ready }} sẵn sàng</span>
+                    <span>{{ realtimeSegmentMetrics.reading }} đang đọc</span>
+                  </div>
+                </div>
+
+                <div class="segment-status-list">
+                  <section
+                    v-for="group in sortedRealtimeChapterGroups"
+                    :key="`realtime-group-${group.chapterId}`"
+                    class="segment-chapter-group"
+                    :class="{ 'is-reading': realtimePlaybackCursor?.chapterId === group.chapterId }"
+                  >
+                    <div class="segment-chapter-head">
+                      <div>
+                        <strong>Chương {{ group.chapterIndex }}</strong>
+                        <p>{{ group.chapterTitle }}</p>
+                      </div>
+                      <span class="segment-status-badge" :class="`is-${group.status === 'completed' ? 'played' : group.status}`">
+                        {{ group.status === 'reading' ? 'Đang đọc' : group.status === 'rendering' ? 'Đang tạo tiếp' : group.status === 'completed' ? 'Đã xong' : 'Đã tách' }}
+                      </span>
+                    </div>
+
+                    <article
+                      v-for="segment in group.segments"
+                      :key="`${group.chapterId}-segment-${segment.index}`"
+                      class="segment-status-item"
+                      :class="[
+                        `is-${segment.status}`,
+                        { 'is-active': realtimePlaybackCursor?.chapterId === group.chapterId && realtimePlaybackCursor?.segmentIndex === segment.index }
+                      ]"
+                      @click="jumpToRealtimeSegment(group.chapterId, segment.index)"
+                    >
+                      <div class="segment-status-top">
+                        <strong>Segment {{ segment.index + 1 }}</strong>
+                        <span class="segment-status-badge" :class="`is-${segment.status}`">
+                          {{ realtimeSegmentStatusLabel(segment.status) }}
+                        </span>
+                      </div>
+                      <p class="segment-status-meta">
+                        {{ segment.wordCount }} từ
+                        <span v-if="segment.attempt > 1"> · lần {{ segment.attempt }}</span>
+                        <span v-if="group.startSegmentIndex === segment.index"> · điểm bắt đầu</span>
+                      </p>
+                      <p class="segment-status-text">{{ segment.text }}</p>
+                      <p v-if="segment.message" class="segment-status-message">{{ segment.message }}</p>
+                    </article>
+                  </section>
+                </div>
+              </section>
             </aside>
 
             <section class="reader-text-pane" :class="{ 'edge-read-aloud-text-pane': useEdgeReadAloud }">
@@ -2009,6 +2421,9 @@ onUnmounted(() => {
                     <button class="ghost-button font-size-button" @click="adjustReaderFontSize(1)" :disabled="readerFontSize >= 28">A+</button>
                     <strong>{{ readerFontSize }}px</strong>
                   </div>
+                  <button class="ghost-button" @click="startRealtimeFromSelection" :disabled="!selectedRealtimeChapterGroup">
+                    Đọc từ bôi chọn
+                  </button>
                   <button class="ghost-button" @click="goToSiblingChapter(-1)" :disabled="!chapterAt(-1)">Chương trước</button>
                   <button class="ghost-button" @click="goToSiblingChapter(1)" :disabled="!chapterAt(1)">Chương sau</button>
                 </div>
@@ -2022,11 +2437,31 @@ onUnmounted(() => {
                 @scroll="scheduleProgressSave"
               >
                 <div ref="readerScanContent" class="reader-scan-content">
-                  <template v-for="(block, index) in formattedChapterBlocks" :key="`${chapterContent.chapterId}-${index}`">
-                    <h3 v-if="block.kind === 'heading'" class="reader-heading" :class="{ 'active-reading': showLegacyReadingHighlight && activeReadingBlockIndex === index }">{{ block.text }}</h3>
-                    <div v-else-if="block.kind === 'divider'" class="reader-divider" :class="{ 'active-reading': showLegacyReadingHighlight && activeReadingBlockIndex === index }">{{ block.text }}</div>
+                  <template v-for="(block, index) in renderableChapterBlocks" :key="`${chapterContent.chapterId}-${index}`">
+                    <h3 v-if="block.kind === 'heading'" class="reader-heading">
+                      <template v-for="token in block.tokens" :key="token.key">
+                        <span
+                          v-if="token.isWord"
+                          class="reader-word"
+                          :class="{ 'is-active-word': token.wordIndex === activeWordGlobalIndex }"
+                          :data-word-index="token.wordIndex ?? undefined"
+                        >{{ token.text }}</span>
+                        <span v-else>{{ token.text }}</span>
+                      </template>
+                    </h3>
+                    <div v-else-if="block.kind === 'divider'" class="reader-divider">{{ block.text }}</div>
                     <div v-else-if="block.kind === 'spacer'" class="reader-spacer" aria-hidden="true"></div>
-                    <p v-else class="reader-paragraph" :class="{ 'active-reading': showLegacyReadingHighlight && activeReadingBlockIndex === index }">{{ block.text }}</p>
+                    <p v-else class="reader-paragraph">
+                      <template v-for="token in block.tokens" :key="token.key">
+                        <span
+                          v-if="token.isWord"
+                          class="reader-word"
+                          :class="{ 'is-active-word': token.wordIndex === activeWordGlobalIndex }"
+                          :data-word-index="token.wordIndex ?? undefined"
+                        >{{ token.text }}</span>
+                        <span v-else>{{ token.text }}</span>
+                      </template>
+                    </p>
                   </template>
                 </div>
               </section>
@@ -2291,7 +2726,7 @@ button:disabled {
   min-height: 0;
   overflow: hidden;
   width: 100%;
-  max-width: 1400px;
+  max-width: 1580px;
 }
 
 .panel {
@@ -2448,7 +2883,7 @@ button:disabled {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(280px, 320px) minmax(0, 1fr);
+  grid-template-columns: minmax(430px, 560px) minmax(0, 1fr);
 }
 
 .reader-layout.edge-read-aloud-layout {
@@ -2517,7 +2952,7 @@ button:disabled {
 }
 
 .reader-head {
-  padding: 1rem 1.25rem;
+  padding: 1.1rem 1.35rem;
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
@@ -2529,7 +2964,7 @@ button:disabled {
 
 .reader-head h2 {
   margin: 0 0 0.3rem;
-  font-size: 1.15rem;
+  font-size: 1.35rem;
 }
 
 .reader-actions {
@@ -2579,21 +3014,41 @@ button:disabled {
 }
 
 .premium-player-column {
-  padding: 0.9rem 0.7rem;
+  padding: 1rem;
   display: flex;
   flex-direction: column;
+  gap: 0.85rem;
   min-height: 0;
   overflow: hidden;
-  background: linear-gradient(180deg, rgba(15, 23, 42, 0.05) 0%, rgba(15, 23, 42, 0.01) 100%);
+  background:
+    radial-gradient(circle at top left, rgba(59, 130, 246, 0.08), transparent 32%),
+    linear-gradient(180deg, rgba(15, 23, 42, 0.05) 0%, rgba(15, 23, 42, 0.01) 100%);
+}
+
+.player-console-head {
+  padding: 0.15rem 0.15rem 0;
+}
+
+.player-console-head h3 {
+  margin: 0.18rem 0 0.15rem;
+  font-size: 1.18rem;
+  line-height: 1.25;
+  color: #0f172a;
+}
+
+.player-console-head p:last-child {
+  margin: 0;
+  font-size: 0.82rem;
+  color: #64748b;
 }
 
 .premium-player-card {
   width: 100%;
-  max-width: 270px;
+  max-width: none;
   margin: 0 auto;
   background: #e9edf4;
   border-radius: 18px;
-  padding: 0.75rem 0.65rem 0.8rem;
+  padding: 0.95rem 0.95rem 1rem;
   box-shadow:
     8px 8px 18px rgba(148, 163, 184, 0.35),
     -8px -8px 18px rgba(255, 255, 255, 0.75);
@@ -2715,6 +3170,213 @@ button:disabled {
   color: #94a3b8;
   margin: 0;
   font-weight: 600;
+}
+
+.player-status-row {
+  margin-top: 0.45rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.player-status-pill,
+.player-voice-label,
+.segment-status-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.18rem 0.48rem;
+  border-radius: 999px;
+  font-size: 0.58rem;
+  font-weight: 700;
+}
+
+.player-status-pill {
+  background: rgba(148, 163, 184, 0.18);
+  color: #475569;
+}
+
+.player-status-pill.is-reading,
+.segment-status-badge.is-reading {
+  background: rgba(37, 99, 235, 0.12);
+  color: #1d4ed8;
+}
+
+.player-status-pill.is-buffering,
+.player-status-pill.is-connecting,
+.segment-status-badge.is-rendering {
+  background: rgba(14, 165, 233, 0.12);
+  color: #0369a1;
+}
+
+.player-status-pill.is-transitioning,
+.segment-status-badge.is-retrying {
+  background: rgba(245, 158, 11, 0.14);
+  color: #b45309;
+}
+
+.player-status-pill.is-finished,
+.segment-status-badge.is-played {
+  background: rgba(34, 197, 94, 0.14);
+  color: #15803d;
+}
+
+.player-status-pill.is-error {
+  background: rgba(239, 68, 68, 0.12);
+  color: #b91c1c;
+}
+
+.player-status-pill.is-stopped,
+.segment-status-badge.is-ready,
+.segment-status-badge.is-queued {
+  background: rgba(100, 116, 139, 0.12);
+  color: #475569;
+}
+
+.player-voice-label {
+  max-width: 100%;
+  color: #64748b;
+  background: rgba(255, 255, 255, 0.55);
+}
+
+.player-status-text {
+  margin: 0.42rem 0 0;
+  font-size: 0.62rem;
+  line-height: 1.5;
+  color: #64748b;
+}
+
+.segment-status-card {
+  width: 100%;
+  background: rgba(255, 255, 255, 0.52);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 14px;
+  padding: 0.55rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.segment-status-card--main {
+  flex: 1;
+  min-height: 0;
+}
+
+.segment-status-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.segment-status-kicker {
+  margin: 0 0 0.14rem;
+  font-size: 0.54rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #94a3b8;
+  font-weight: 700;
+}
+
+.segment-status-head strong {
+  font-size: 0.7rem;
+  color: #334155;
+}
+
+.segment-status-metrics {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.14rem;
+  font-size: 0.56rem;
+  color: #64748b;
+  text-align: right;
+}
+
+.segment-status-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  max-height: none;
+  overflow-y: auto;
+  padding-right: 0.15rem;
+  min-height: 0;
+}
+
+.segment-chapter-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.segment-chapter-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.4rem;
+}
+
+.segment-chapter-head strong {
+  font-size: 0.66rem;
+  color: #334155;
+}
+
+.segment-chapter-head p {
+  margin: 0.12rem 0 0;
+  font-size: 0.56rem;
+  color: #64748b;
+}
+
+.segment-status-item {
+  border-radius: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  background: rgba(248, 250, 252, 0.72);
+  padding: 0.5rem 0.58rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.22rem;
+  cursor: pointer;
+}
+
+.segment-status-item.is-active {
+  border-color: rgba(37, 99, 235, 0.28);
+  box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.12);
+}
+
+.segment-status-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+}
+
+.segment-status-top strong {
+  font-size: 0.64rem;
+  color: #334155;
+}
+
+.segment-status-meta,
+.segment-status-message {
+  margin: 0;
+  font-size: 0.55rem;
+  color: #64748b;
+}
+
+.segment-status-message {
+  color: #b45309;
+}
+
+.segment-status-text {
+  margin: 0;
+  font-size: 0.61rem;
+  line-height: 1.5;
+  color: #475569;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .player-main-controls {
@@ -3063,6 +3725,17 @@ button:disabled {
   font-weight: 700;
   letter-spacing: -0.015em;
   white-space: pre-wrap;
+}
+
+.reader-word {
+  border-radius: 0.45rem;
+  transition: background-color 0.18s ease, color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.reader-word.is-active-word {
+  background: rgba(37, 99, 235, 0.16);
+  color: #1d4ed8;
+  box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.08);
 }
 
 .reader-paragraph {

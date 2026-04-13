@@ -156,14 +156,26 @@ export interface RealtimeSession {
   autoNext: boolean
 }
 
+export interface RealtimeSegmentItem {
+  index: number
+  text: string
+  wordCount?: number
+  durationEstimate?: number
+}
+
 export interface RealtimeSessionState {
   type:
   | 'session_started'
   | 'controls_updated'
   | 'audio_format'
+  | 'chapter_segments'
   | 'chunk_started'
   | 'chunk_finished'
+  | 'segment_rendering'
+  | 'segment_ready'
+  | 'segment_retry'
   | 'segment_started'
+  | 'segment_finished'
   | 'chapter_started'
   | 'chapter_finished'
   | 'chapter_transition'
@@ -192,4 +204,9 @@ export interface RealtimeSessionState {
   reason?: string
   message?: string
   status?: string
+  attempt?: number
+  segments?: RealtimeSegmentItem[]
+  wordCount?: number
+  durationEstimate?: number
+  startSegmentIndex?: number
 }

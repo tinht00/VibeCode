@@ -53,7 +53,7 @@ File này là điểm điều hướng tối thiểu cho agent và lập trình 
 - Nếu dự án có yêu cầu môi trường đặc biệt như DB version cũ, NAS mount, message broker, rule deploy riêng, ghi lại rõ ở đó và tóm tắt lại tại đây nếu cần.
 - Trạng thái hiện tại của repo đã có source code nền cho:
   - backend `Go + Gin + SQLite` cho import thư viện, chapter content và progress
-  - service `Python + FastAPI + RealtimeTTS + EdgeEngine` cho luồng nghe realtime
+  - service `Python + FastAPI + edge_tts` cho luồng nghe realtime
   - frontend `Vue 3 + Vite` theo mô hình reader 3 cột
   - docs v1 cho kiến trúc reader TXT local, realtime TTS và decision log
 - Luồng chính hiện tại là `folder picker -> import TXT -> đọc chương -> realtime TTS -> lưu tiến độ`.

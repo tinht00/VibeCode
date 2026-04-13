@@ -54,6 +54,7 @@ export const api = {
       speed: number
       pitch: number
       autoNext: boolean
+      startSegmentIndex?: number
     }
   ) =>
     request<RealtimeSession>(`${baseUrl}/sessions`, {
@@ -85,5 +86,17 @@ export const api = {
   skipRealtimePrev: (baseUrl: string, id: string) =>
     request<{ status: string; id: string }>(`${baseUrl}/sessions/${id}/skip-prev`, {
       method: 'POST'
+    }),
+  seekRealtimeSession: (
+    baseUrl: string,
+    id: string,
+    payload: {
+      chapterId: number
+      segmentIndex: number
+    }
+  ) =>
+    request<RealtimeSession>(`${baseUrl}/sessions/${id}/seek`, {
+      method: 'POST',
+      body: JSON.stringify(payload)
     })
 }

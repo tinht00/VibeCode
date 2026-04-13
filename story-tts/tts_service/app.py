@@ -1,20 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
+import queue
 import re
+import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
+import edge_tts
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
-from RealtimeTTS import TextToAudioStream, EdgeEngine
 
 logger = logging.getLogger("story_tts_realtime")
 logging.basicConfig(level=logging.INFO)
@@ -56,6 +59,7 @@ class CreateSessionRequest(BaseModel):
     speed: int = 0
     pitch: int = 0
     autoNext: bool = True
+    startSegmentIndex: int = 0
 
 
 class UpdateSessionControlsRequest(BaseModel):
@@ -63,6 +67,11 @@ class UpdateSessionControlsRequest(BaseModel):
     speed: int | None = None
     pitch: int | None = None
     autoNext: bool | None = None
+
+
+class SeekSessionRequest(BaseModel):
+    chapterId: int
+    segmentIndex: int = 0
 
 
 class SessionResponse(BaseModel):
@@ -95,41 +104,165 @@ def normalize_text(text: str) -> str:
     return cleaned.strip()
 
 
-def split_chapter_into_chunks(text: str, num_chunks: int = 20) -> list[str]:
-    """Chia chapter thành nhiều đoạn nhỏ để tổng hợp tuần tự."""
+def split_chapter_into_segments(text: str) -> list[str]:
+    """
+    Chia chapter thành các đoạn nhỏ theo số từ (word count):
+    - Đoạn 1, 2, 3: tối đa 150 từ
+    - Đoạn 4+: tối đa 200 từ
+    - Tìm dấu ngắt câu gần nhất (.,;:!?…) trong khoảng ±20 từ để không cắt cụt câu
+    - Giữ nguyên boundary đoạn văn (\n\n), không cắt giữa đoạn nếu có thể
+    """
     normalized = normalize_text(text)
     if not normalized:
         return []
 
+    # Tách thành các đoạn văn lớn (giữ \n\n làm boundary)
     paragraphs = [part.strip() for part in re.split(r"\n{2,}", normalized) if part.strip()]
     if not paragraphs:
         return []
 
-    total_chars = sum(len(p) for p in paragraphs)
-    chars_per_chunk = total_chars // num_chunks
+    # Gộp tất cả từ thành list để dễ xử lý
+    all_words = []
+    word_to_paragraph_map = []  # Ánh xạ word index -> paragraph index
 
-    if chars_per_chunk < 200:
-        return ['\n\n'.join(paragraphs)]
+    for para_idx, para in enumerate(paragraphs):
+        words = para.split()
+        all_words.extend(words)
+        word_to_paragraph_map.extend([para_idx] * len(words))
 
-    chunks = []
-    current_chunk = []
-    current_length = 0
+    if not all_words:
+        return []
 
-    for para in paragraphs:
-        current_chunk.append(para)
-        current_length += len(para)
+    segments = []
+    word_idx = 0
+    segment_number = 0
 
-        if current_length >= chars_per_chunk and len(chunks) < num_chunks - 1:
-            chunks.append('\n\n'.join(current_chunk))
-            current_chunk = []
-            current_length = 0
+    while word_idx < len(all_words):
+        segment_number += 1
 
-    if current_chunk:
-        chunks.append('\n\n'.join(current_chunk))
+        # Xác định giới hạn từ theo số thứ tự đoạn
+        if segment_number <= 3:
+            max_words = 150
+        else:
+            max_words = 200
 
-    logger.info("Chapter split into %d chunks (target: %d, avg %d chars each)",
-               len(chunks), num_chunks, total_chars // max(len(chunks), 1))
-    return chunks
+        # Tính khoảng từ cần lấy
+        target_end = min(word_idx + max_words, len(all_words))
+
+        # Nếu còn ít từ hơn max_words, lấy hết
+        if target_end >= len(all_words):
+            segment_text = " ".join(all_words[word_idx:])
+            segments.append(segment_text)
+            break
+
+        # Tìm dấu ngắt câu gần nhất trong khoảng ±20 từ từ target_end
+        best_split = target_end
+        
+        # Xác định khoảng tìm kiếm: từ (target_end - 20) đến (target_end + 20)
+        search_window_start = max(word_idx + max_words - 20, word_idx + 50)  # Tối thiểu 50 từ
+        search_window_end = min(target_end + 20, len(all_words))
+        
+        if search_window_start < target_end:
+            # Gộp text trong khoảng tìm kiếm
+            search_text = " ".join(all_words[word_idx:search_window_end])
+            
+            # Tìm dấu ngắt câu ưu tiên: . ! ? > , ; : > …
+            breakpoint_chars = ['.', '!', '?', ',', ';', ':', '…']
+            best_break_pos = -1
+            
+            # Tìm trong khoảng từ (max_words - 20) đến (max_words + 20) từ
+            min_words_in_segment = max_words - 20
+            max_words_in_segment = max_words + 20
+            
+            for break_char in breakpoint_chars:
+                # Tìm tất cả vị trí của break_char
+                start_pos = 0
+                while True:
+                    pos = search_text.find(break_char, start_pos)
+                    if pos == -1:
+                        break
+                    
+                    # Đếm số từ trước vị trí này
+                    words_before = len(search_text[:pos+1].split())
+                    
+                    # Kiểm tra xem có trong khoảng chấp nhận được không
+                    if min_words_in_segment <= words_before <= max_words_in_segment:
+                        # Ưu tiên dấu câu mạnh (. ! ?) hơn (, ; :)
+                        if break_char in '.!?':
+                            best_break_pos = pos
+                            break  # Tìm thấy dấu mạnh, dừng ngay
+                        elif best_break_pos == -1 or break_char not in ',;:…':
+                            best_break_pos = pos
+                    
+                    start_pos = pos + 1
+            
+            if best_break_pos > 0:
+                # Tính lại word index tại vị trí break
+                text_before_break = search_text[:best_break_pos+1]
+                words_in_segment = len(text_before_break.split())
+                best_split = word_idx + words_in_segment
+
+        # Tạo segment từ word_idx đến best_split
+        segment_words = all_words[word_idx:best_split]
+
+        # Ghép lại thành text, giữ paragraph boundary nếu có
+        segment_text = _build_segment_with_paragraphs(
+            segment_words, word_idx, best_split, word_to_paragraph_map, paragraphs
+        )
+
+        segments.append(segment_text)
+        word_idx = best_split
+
+    logger.info("Chapter split into %d segments (word-based: 150/200 words)", len(segments))
+    return segments
+
+
+def _build_segment_with_paragraphs(
+    words: list[str],
+    start_word_idx: int,
+    end_word_idx: int,
+    word_to_para_map: list[int],
+    paragraphs: list[str],
+) -> str:
+    """
+    Gộp các từ thành text segment, giữ paragraph boundary (\n\n) khi có thể.
+    """
+    if not words:
+        return ""
+
+    # Xác định các paragraph tham gia vào segment này
+    para_indices = set()
+    for word_idx in range(start_word_idx, min(end_word_idx, len(word_to_para_map))):
+        para_indices.add(word_to_para_map[word_idx])
+
+    # Nếu chỉ có 1 paragraph, trả về đơn giản
+    if len(para_indices) == 1:
+        return " ".join(words)
+
+    # Nhiều paragraph: cần reconstruct lại text với \n\n
+    result_parts = []
+    current_para_idx = -1
+    current_para_words = []
+
+    for i, word in enumerate(words):
+        global_word_idx = start_word_idx + i
+        para_idx = word_to_para_map[global_word_idx]
+
+        if para_idx != current_para_idx:
+            # Paragraph mới
+            if current_para_words:
+                result_parts.append(" ".join(current_para_words))
+            if current_para_idx != -1:
+                result_parts.append("\n\n")
+            current_para_idx = para_idx
+            current_para_words = [word]
+        else:
+            current_para_words.append(word)
+
+    if current_para_words:
+        result_parts.append(" ".join(current_para_words))
+
+    return "".join(result_parts)
 
 
 def split_into_segments(text: str, max_chars: int = 600) -> list[str]:
@@ -166,83 +299,127 @@ def prepare_tts_segment(text: str) -> str:
     return normalize_text(text)
 
 
-# ─── RealtimeTTS Synthesis ────────────────────────────────────────────────────
+# ─── Edge-TTS Synthesis ───────────────────────────────────────────────────────
 
 
-def synthesize_chunk_realtime(
+def _format_prosody(speed: int, pitch: int) -> tuple[str, str]:
+    rate_str = f"+{speed}%" if speed >= 0 else f"{speed}%"
+    pitch_str = f"+{pitch}Hz" if pitch >= 0 else f"{pitch}Hz"
+    return rate_str, pitch_str
+
+
+def _preview_text(text: str, limit: int = 96) -> str:
+    compact = re.sub(r"\s+", " ", text).strip()
+    if len(compact) <= limit:
+        return compact
+    return f"{compact[:limit].rstrip()}..."
+
+
+def _format_exception(exc: Exception) -> str:
+    message = str(exc).strip()
+    return message or exc.__class__.__name__
+
+
+def _segment_retry_delay(attempt: int) -> float:
+    return min(8.0, 0.8 * attempt)
+
+
+async def _save_audio_with_edge_tts(
     text: str,
     voice: str,
     speed: int,
     pitch: int,
-    session: "RuntimeSession",
-    on_chunk_callback,
-    max_retries: int = 5,
+    output_path: str,
+    timeout_seconds: float,
+) -> None:
+    rate_str, pitch_str = _format_prosody(speed, pitch)
+    communicate = edge_tts.Communicate(
+        text=text,
+        voice=voice,
+        rate=rate_str,
+        pitch=pitch_str,
+        connect_timeout=15,
+        receive_timeout=max(30, int(timeout_seconds)),
+    )
+    await asyncio.wait_for(communicate.save(output_path), timeout=timeout_seconds)
+
+
+def synthesize_segment_edge_tts(
+    text: str,
+    voice: str,
+    speed: int,
+    pitch: int,
+    output_path: str,
+    max_retries: int = 2,
+    timeout_seconds: float = 90.0,
 ) -> tuple[int, float]:
     """
-    Sử dụng RealtimeTTS để tổng hợp và stream audio real-time.
-    Trả về (total_bytes, estimated_duration_seconds).
+    Dùng edge_tts Python API để tổng hợp text thành file MP3.
+    Trả về (file_size_bytes, estimated_duration_seconds).
     """
     if not text.strip():
         return 0, 0.0
 
     last_error = None
-    rate_percent = speed  # RealtimeTTS dùng -100 đến 100
-    pitch_hz = pitch      # RealtimeTTS dùng -100 đến 100
-
     for attempt in range(1, max_retries + 1):
         try:
-            # Tạo EdgeEngine với voice được chỉ định
-            engine = EdgeEngine(voice=voice)
+            if os.path.exists(output_path):
+                os.unlink(output_path)
 
-            # Tạo TextToAudioStream
-            stream = TextToAudioStream(engine)
-            stream.feed(text)
-
-            # Stream audio real-time với callback
-            total_bytes = 0
-            chunk_count = 0
-
-            def on_audio_chunk(chunk: bytes):
-                nonlocal total_bytes, chunk_count
-                total_bytes += len(chunk)
-                chunk_count += 1
-                on_chunk_callback(chunk)
-
-            # Synthesize và stream real-time
-            # muted=True để không play ra loa, chỉ callback
-            stream.play(
-                on_audio_chunk=on_audio_chunk,
-                muted=True,
-                rate=rate_percent,
-                pitch=pitch_hz,
+            asyncio.run(
+                _save_audio_with_edge_tts(
+                    text=text,
+                    voice=voice,
+                    speed=speed,
+                    pitch=pitch,
+                    output_path=output_path,
+                    timeout_seconds=timeout_seconds,
+                )
             )
 
-            if total_bytes > 0:
-                # Ước lượng thời lượng: PCM/WAV ~16KB/s cho voice 16kHz mono
-                # RealtimeTTS output là PCM format
-                speed_factor = 1.0 + (speed / 100.0)
-                BYTES_PER_SECOND = 16000  # ~16KB/s cho PCM 16kHz mono
-                estimated_duration = total_bytes / (BYTES_PER_SECOND * speed_factor)
+            if not os.path.exists(output_path):
+                raise RuntimeError("edge_tts không tạo file audio")
 
-                logger.debug("Synthesized chunk: %d bytes (%d chunks), estimated %.1fs",
-                           total_bytes, chunk_count, estimated_duration)
-                return total_bytes, estimated_duration
-            else:
-                raise RuntimeError("RealtimeTTS không tạo được audio")
+            file_size = os.path.getsize(output_path)
+            if file_size == 0:
+                raise RuntimeError("edge_tts tạo file audio rỗng")
 
+            # Ước lượng thời lượng: MP3 24kHz mono ~24kbps = 3KB/s
+            # Thực tế edge-tts 24khz 48kbitrate = 6KB/s
+            bytes_per_second = 6000
+            estimated_duration = file_size / bytes_per_second
+
+            logger.debug("Synthesized segment: %d bytes, %.1fs", file_size, estimated_duration)
+            return file_size, estimated_duration
+
+        except TimeoutError:
+            last_error = RuntimeError(f"edge_tts timeout ({timeout_seconds:.0f}s)")
         except Exception as e:
             last_error = e
-            logger.warning("RealtimeTTS attempt %d failed: %s", attempt, e)
-            if attempt < max_retries:
-                wait_time = min(60, 30 + (attempt * 5))
-                logger.warning("Waiting %ds before next retry...", wait_time)
-                time.sleep(wait_time)
-            continue
 
-    raise RuntimeError(f"RealtimeTTS lỗi sau {max_retries} lần thử: {last_error}")
+        if attempt < max_retries:
+            logger.warning(
+                "Render retry %d/%d cho voice=%s: %s",
+                attempt,
+                max_retries,
+                voice,
+                _format_exception(last_error),
+            )
+            time.sleep(0.4 * attempt)
+
+    raise RuntimeError(f"edge_tts lỗi sau {max_retries} lần thử: {_format_exception(last_error)}")
 
 
 # ─── Session Management ───────────────────────────────────────────────────────
+
+
+@dataclass
+class RenderedSegment:
+    """Lưu kết quả render của một đoạn."""
+    index: int
+    audio_data: bytes
+    duration_estimate: float
+    text: str
 
 
 @dataclass
@@ -255,11 +432,13 @@ class RuntimeSession:
     speed: int
     pitch: int
     auto_next: bool
+    start_segment_index: int = 0
     created_at: str = field(default_factory=now_iso)
     updated_at: str = field(default_factory=now_iso)
     status: str = "pending"
     last_error: str = ""
     pending_index: int | None = None
+    pending_segment_index: int | None = None
     loop: Any = None
     outbox: Any = None
     worker: threading.Thread | None = None
@@ -267,6 +446,17 @@ class RuntimeSession:
     current_stream: Any = None
     lock: threading.RLock = field(default_factory=threading.RLock)
     closed: threading.Event = field(default_factory=threading.Event)
+
+    # Pipeline rendering
+    render_executor: ThreadPoolExecutor = field(default_factory=lambda: ThreadPoolExecutor(max_workers=3))
+    segment_queue: queue.Queue = field(default_factory=queue.Queue)  # Queue chứa RenderedSegment
+    rendered_segments: dict[int, RenderedSegment] = field(default_factory=dict)
+    render_futures: dict[int, Future] = field(default_factory=dict)
+    pipeline_window: int = 3  # Số đoạn render trước
+    current_segment_index: int = 0
+    total_segments: int = 0
+    segments_to_render: list[str] = field(default_factory=list)  # Danh sách text các đoạn
+    initial_segment_anchor_used: bool = False
 
     def to_response(self) -> SessionResponse:
         chapter = self.chapters[self.current_index]
@@ -297,7 +487,7 @@ class RuntimeSession:
                 name=f"tts-session-{self.id}"
             )
             self.worker.start()
-            logger.info("Worker thread started for session %s", self.id)
+            logger.info("Session %s da khoi dong worker", self.id)
 
     def stop(self) -> None:
         self.stop_requested.set()
@@ -307,7 +497,23 @@ class RuntimeSession:
         with self.lock:
             target_index = max(0, min(self.current_index + delta, len(self.chapters) - 1))
             self.pending_index = target_index
+            self.pending_segment_index = 0
         self._stop_stream()
+
+    def seek(self, request: SeekSessionRequest) -> SessionResponse:
+        with self.lock:
+            try:
+                target_index = next(
+                    index for index, item in enumerate(self.chapters)
+                    if item.chapterId == request.chapterId
+                )
+            except StopIteration as exc:
+                raise HTTPException(status_code=400, detail="Không tìm thấy chapterId để seek") from exc
+
+            self.pending_index = target_index
+            self.pending_segment_index = max(0, request.segmentIndex)
+
+        return self.to_response()
 
     def update_controls(self, controls: UpdateSessionControlsRequest) -> SessionResponse:
         with self.lock:
@@ -364,11 +570,149 @@ class RuntimeSession:
             self.loop,
         )
 
+    def render_single_segment(
+        self,
+        chapter_id: int,
+        chapter_index: int,
+        chapter_title: str,
+        segment_index: int,
+        text: str,
+    ) -> Optional[RenderedSegment]:
+        """
+        Render một đoạn thành MP3 file dùng edge_tts Python API, trả về RenderedSegment.
+        Chạy trong render_executor (thread pool).
+        """
+        if not text.strip():
+            return None
+
+        try:
+            # Tạo temp file cho MP3 output
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+                tmp_path = tmp.name
+
+            try:
+                file_size, estimated_duration = synthesize_segment_edge_tts(
+                    text=text,
+                    voice=self.voice,
+                    speed=self.speed,
+                    pitch=self.pitch,
+                    output_path=tmp_path,
+                    max_retries=2,
+                    timeout_seconds=90.0,
+                )
+
+                # Đọc MP3 data
+                with open(tmp_path, "rb") as f:
+                    audio_data = f.read()
+
+                self.emit_event({
+                    "type": "segment_ready",
+                    "sessionId": self.id,
+                    "chapterId": chapter_id,
+                    "chapterIndex": chapter_index,
+                    "chapterTitle": chapter_title,
+                    "segmentIndex": segment_index,
+                    "totalSegments": self.total_segments,
+                    "segmentText": text[:200],
+                    "wordCount": len(text.split()),
+                    "durationEstimate": estimated_duration,
+                })
+                logger.debug("Rendered segment %d: %d bytes (%.1fs)", segment_index, file_size, estimated_duration)
+                return RenderedSegment(
+                    index=segment_index,
+                    audio_data=audio_data,
+                    duration_estimate=estimated_duration,
+                    text=text,
+                )
+
+            finally:
+                # Cleanup temp file
+                with contextlib.suppress(FileNotFoundError, PermissionError):
+                    os.unlink(tmp_path)
+        except Exception as e:
+            logger.warning(
+                "Segment %d render lỗi: %s | preview=%r",
+                segment_index,
+                _format_exception(e),
+                _preview_text(text),
+            )
+
+        return None
+
+    def _submit_segment_render(
+        self,
+        chapter: RealtimeChapterPayload,
+        segment_index: int,
+        attempt: int = 1,
+    ) -> None:
+        if segment_index >= len(self.segments_to_render):
+            return
+        if segment_index in self.rendered_segments or segment_index in self.render_futures:
+            return
+
+        segment_text = self.segments_to_render[segment_index]
+        self.emit_event({
+            "type": "segment_rendering",
+            "sessionId": self.id,
+            "chapterId": chapter.chapterId,
+            "chapterIndex": chapter.chapterIndex,
+            "segmentIndex": segment_index,
+            "totalSegments": self.total_segments,
+            "segmentText": segment_text[:200],
+            "wordCount": len(segment_text.split()),
+            "attempt": attempt,
+        })
+        future = self.render_executor.submit(
+            self.render_single_segment,
+            chapter.chapterId,
+            chapter.chapterIndex,
+            chapter.title,
+            segment_index,
+            segment_text,
+        )
+        self.render_futures[segment_index] = future
+
+    def _ensure_pipeline_ahead(self, chapter: RealtimeChapterPayload, start_segment_index: int):
+        """
+        Đảm bảo các đoạn từ start_segment_index đến start_segment_index + pipeline_window
+        đã được submit để render.
+        """
+        end_index = min(start_segment_index + self.pipeline_window, self.total_segments)
+
+        for seg_idx in range(start_segment_index, end_index):
+            self._submit_segment_render(chapter, seg_idx)
+
+    def _consume_same_chapter_seek(self, chapter: RealtimeChapterPayload) -> bool:
+        with self.lock:
+            if self.pending_index != self.current_index or self.pending_segment_index is None:
+                return False
+            target_segment_index = max(0, min(self.pending_segment_index, self.total_segments - 1))
+            self.current_segment_index = target_segment_index
+            self.pending_index = None
+            self.pending_segment_index = None
+
+        self.emit_event({
+            "type": "chapter_segments",
+            "sessionId": self.id,
+            "chapterId": chapter.chapterId,
+            "chapterIndex": chapter.chapterIndex,
+            "chapterTitle": chapter.title,
+            "totalSegments": self.total_segments,
+            "segments": [
+                {
+                    "index": index,
+                    "text": segment,
+                    "wordCount": len(segment.split()),
+                }
+                for index, segment in enumerate(self.segments_to_render)
+            ],
+            "startSegmentIndex": target_segment_index,
+        })
+        return True
+
     def _run(self) -> None:
-        logger.info("Worker thread started for session %s", self.id)
         try:
             self.status = "streaming"
-            logger.info("Emitting session_started event for session %s", self.id)
             self.emit_event({
                 "type": "session_started",
                 "sessionId": self.id,
@@ -380,7 +724,7 @@ class RuntimeSession:
                 "pitch": self.pitch,
                 "autoNext": self.auto_next,
             })
-            self.emit_event({"type": "audio_format", "mime": "audio/wav"})
+            self.emit_event({"type": "audio_format", "mime": "audio/mpeg"})
             logger.info("Session %s setup complete, starting chapter loop", self.id)
 
             chapter_index = self.current_index
@@ -407,26 +751,32 @@ class RuntimeSession:
                     "chapterTitle": chapter.title,
                 })
 
-                interrupted = self._stream_chapter(chapter)
-                if self.stop_requested.is_set():
+                stream_result = self._stream_chapter(chapter)
+
+                if stream_result == "stopped" or self.stop_requested.is_set():
                     self.status = "stopped"
                     self.emit_event({"type": "stopped", "sessionId": self.id})
                     break
 
                 with self.lock:
                     if self.pending_index is not None:
+                        target_index = self.pending_index
+                        target_segment_index = self.pending_segment_index or 0
                         self.emit_event({
                             "type": "chapter_transition",
                             "sessionId": self.id,
                             "fromChapterId": chapter.chapterId,
-                            "toChapterId": self.chapters[self.pending_index].chapterId,
-                            "reason": "skip",
+                            "toChapterId": self.chapters[target_index].chapterId,
+                            "reason": "seek" if target_segment_index > 0 or target_index != chapter_index else "skip",
                         })
-                        chapter_index = self.pending_index
+                        chapter_index = target_index
+                        self.start_segment_index = target_segment_index
+                        self.initial_segment_anchor_used = False
                         self.pending_index = None
+                        self.pending_segment_index = None
                         continue
 
-                if interrupted:
+                if stream_result == "skipped":
                     continue
 
                 self.emit_event({
@@ -468,163 +818,200 @@ class RuntimeSession:
             self.closed.set()
             self.emit_event({"type": "stream_closed", "sessionId": self.id, "status": self.status})
 
-    def _stream_chapter(self, chapter: RealtimeChapterPayload) -> bool:
-        # Chia chapter thành nhiều đoạn nhỏ
-        large_chunks = split_chapter_into_chunks(chapter.text, num_chunks=20)
-        if not large_chunks:
-            return False
+    def _stream_chapter(self, chapter: RealtimeChapterPayload) -> str:
+        """
+        Stream chapter với pipeline rendering:
+        1. Chia chapter thành các đoạn (150 từ cho đoạn 1-3, 200 từ cho đoạn 4+)
+        2. Đọc đoạn 1 → render trước các đoạn 2, 3, 4
+        3. Sau khi đọc đoạn N → đảm bảo đã render xong đoạn N+1
+        4. Continue cho đến hết, đảm bảo không sót đoạn nào
+        """
+        # Chia chapter thành các đoạn theo word count
+        segments = split_chapter_into_segments(chapter.text)
+        if not segments:
+            return "completed"
 
-        logger.info("Chapter %d split into %d chunks for sequential synthesis",
-                   chapter.chapterIndex, len(large_chunks))
+        # Setup pipeline state
+        self.segments_to_render = segments
+        self.total_segments = len(segments)
+        if chapter.chapterId == self.chapters[self.current_index].chapterId and not self.initial_segment_anchor_used:
+            self.current_segment_index = max(0, min(self.start_segment_index, self.total_segments - 1))
+            self.initial_segment_anchor_used = True
+        else:
+            self.current_segment_index = 0
+        self.rendered_segments.clear()
+        self.render_futures.clear()
 
-        chunk_failures = 0
-        max_chunk_failures = max(3, len(large_chunks) // 3)
+        logger.info("Chapter %d split into %d segments for pipeline synthesis",
+                   chapter.chapterIndex, len(segments))
+        self.emit_event({
+            "type": "chapter_segments",
+            "sessionId": self.id,
+            "chapterId": chapter.chapterId,
+            "chapterIndex": chapter.chapterIndex,
+            "chapterTitle": chapter.title,
+            "totalSegments": self.total_segments,
+            "segments": [
+                {
+                    "index": index,
+                    "text": segment,
+                    "wordCount": len(segment.split()),
+                }
+                for index, segment in enumerate(segments)
+            ],
+            "startSegmentIndex": self.current_segment_index,
+        })
 
         interrupted = False
-        chunk_index = 0
-        successful_chunks = 0
 
-        for chunk in large_chunks:
-            prepared_chunk = prepare_tts_segment(chunk)
-            if not prepared_chunk:
-                chunk_index += 1
+        # Bắt đầu pipeline: render trước 3 đoạn đầu tiên
+        self._ensure_pipeline_ahead(chapter, 0)
+
+        # Đọc và phát tuần tự từng đoạn
+        while self.current_segment_index < self.total_segments:
+            if self.stop_requested.is_set():
+                return "stopped"
+
+            if self._consume_same_chapter_seek(chapter):
                 continue
 
             with self.lock:
-                current_voice = self.voice
-                current_speed = self.speed
-                current_pitch = self.pitch
-                pending_index = self.pending_index
+                if self.pending_index is not None:
+                    return "skipped"
 
-            if self.stop_requested.is_set() or pending_index is not None:
-                interrupted = True
-                break
+            seg_idx = self.current_segment_index
 
-            # Chia chunk thành sub-segments cho highlighting
-            sub_segments = split_into_segments(prepared_chunk, max_chars=600)
+            # Đảm bảo pipeline: render trước các đoạn ahead
+            self._ensure_pipeline_ahead(chapter, seg_idx + 1)
 
-            logger.info("Synthesizing chunk %d/%d (%d chars, %d segments)",
-                       chunk_index + 1, len(large_chunks), len(prepared_chunk), len(sub_segments))
+            # Chờ segment hiện tại được render xong
+            rendered = self._wait_for_segment(chapter, seg_idx)
 
-            self.emit_event({
-                "type": "chunk_started",
-                "sessionId": self.id,
-                "chunkIndex": chunk_index,
-                "totalChunks": len(large_chunks),
-            })
-
-            # Tổng hợp chunk với RealtimeTTS (stream real-time)
-            total_bytes = 0
-            estimated_duration = 0.0
-            retry_count = 0
-
-            while total_bytes == 0:
-                if retry_count > 0:
-                    wait_time = min(60, 30 + (retry_count * 3))
-                    logger.warning("Chunk %d failed (attempt #%d), waiting %ds before retry...",
-                                 chunk_index, retry_count, wait_time)
-
-                    wait_start = time.time()
-                    while time.time() - wait_start < wait_time:
-                        if self.stop_requested.is_set():
-                            logger.info("Stop requested during retry wait for chunk %d", chunk_index)
-                            interrupted = True
-                            break
-                        with self.lock:
-                            if self.pending_index is not None:
-                                logger.info("Pending index changed during retry wait for chunk %d", chunk_index)
-                                interrupted = True
-                                break
-                        time.sleep(1)
-
-                    if interrupted:
-                        break
-
-                try:
-                    def on_audio_chunk_callback(chunk: bytes):
-                        nonlocal total_bytes
-                        total_bytes += len(chunk)
-                        self.emit_audio(chunk)
-
-                    total_bytes, estimated_duration = synthesize_chunk_realtime(
-                        prepared_chunk,
-                        current_voice,
-                        current_speed,
-                        current_pitch,
-                        self,
-                        on_audio_chunk_callback,
-                        max_retries=3,
-                    )
-                except Exception as e:
-                    retry_count += 1
-                    logger.error("Chunk %d synthesis failed (retry #%d): %s", chunk_index, retry_count, e)
+            if rendered is None:
+                if self.stop_requested.is_set():
+                    return "stopped"
+                if self._consume_same_chapter_seek(chapter):
                     continue
-
-            if interrupted:
-                break
-
-            if total_bytes == 0:
-                logger.warning("Chunk %d synthesis returned empty audio", chunk_index)
-                chunk_failures += 1
-                chunk_index += 1
+                with self.lock:
+                    if self.pending_index is not None:
+                        return "skipped"
                 continue
 
-            successful_chunks += 1
-            logger.info("Chunk %d synthesized successfully (%d bytes, %.1fs) after %d retries",
-                       chunk_index, total_bytes, estimated_duration, retry_count)
+            # Phát audio segment đã render
+            self.emit_event({
+                "type": "segment_started",
+                "sessionId": self.id,
+                "chapterId": chapter.chapterId,
+                "chapterIndex": chapter.chapterIndex,
+                "segmentIndex": seg_idx,
+                "totalSegments": self.total_segments,
+                "segmentText": rendered.text[:200],
+                "wordCount": len(rendered.text.split()),
+                "durationEstimate": rendered.duration_estimate,
+            })
 
-            # Tính timing cho segment events
-            seconds_per_sub = estimated_duration / max(len(sub_segments), 1)
-            BUFFER_DELAY_SEC = 1.0  # RealtimeTTS stream real-time nên buffer ít hơn
-            effective_start_time = time.time() + BUFFER_DELAY_SEC
-
-            logger.info("Chunk %d: %d bytes, estimated %.1fs (%.2fs per segment, speed=%.0f%%)",
-                       chunk_index, total_bytes, estimated_duration, seconds_per_sub, current_speed)
-
-            # Emit segment events với delay đồng bộ playback
-            sub_index = 0
-            for sub_idx in range(len(sub_segments)):
-                emit_time = effective_start_time + (sub_idx * seconds_per_sub)
-                wait_sec = emit_time - time.time()
-
-                if wait_sec > 0:
-                    time.sleep(wait_sec)
-
+            # Gửi audio data
+            chunk_size = 4096
+            interrupted_by_seek = False
+            for offset in range(0, len(rendered.audio_data), chunk_size):
                 if self.stop_requested.is_set():
                     interrupted = True
                     break
                 with self.lock:
                     if self.pending_index is not None:
-                        interrupted = True
+                        interrupted_by_seek = True
                         break
-
-                sub_index = sub_idx
-                self.emit_event({
-                    "type": "segment_started",
-                    "sessionId": self.id,
-                    "segmentIndex": sub_index,
-                    "totalSegments": len(sub_segments),
-                    "chunkIndex": chunk_index,
-                    "segmentText": sub_segments[sub_index][:200],
-                })
+                chunk = rendered.audio_data[offset:offset + chunk_size]
+                self.emit_audio(chunk)
+                # Sleep nhỏ để tránh gửi quá nhanh
+                time.sleep(0.001)
 
             if interrupted:
                 break
 
-            with self.lock:
-                self.current_stream = None
+            if interrupted_by_seek:
+                if self._consume_same_chapter_seek(chapter):
+                    continue
+                return "skipped"
 
             self.emit_event({
-                "type": "chunk_finished",
+                "type": "segment_finished",
                 "sessionId": self.id,
-                "chunkIndex": chunk_index,
+                "chapterId": chapter.chapterId,
+                "chapterIndex": chapter.chapterIndex,
+                "segmentIndex": seg_idx,
             })
 
-            chunk_index += 1
+            self.render_futures.pop(seg_idx, None)
 
-        logger.info("Chapter %d finished: %d/%d chunks successful, %d failed",
-                   chapter.chapterIndex, successful_chunks, len(large_chunks), chunk_failures)
-        return interrupted
+            self.current_segment_index += 1
+
+        logger.info("Chapter %d finished: %d/%d segments synthesized",
+                   chapter.chapterIndex, self.current_segment_index, self.total_segments)
+        if interrupted:
+            return "stopped"
+        return "completed"
+
+    def _wait_for_segment(
+        self,
+        chapter: RealtimeChapterPayload,
+        segment_index: int,
+        timeout: float = 90.0,
+    ) -> Optional[RenderedSegment]:
+        """
+        Chờ một segment được render xong.
+        Nếu đã có trong cache thì trả về ngay.
+        Nếu render lỗi thì submit lại cho tới khi thành công hoặc session bị dừng.
+        """
+        attempt = 0
+
+        while not self.stop_requested.is_set():
+            with self.lock:
+                if self.pending_index is not None:
+                    return None
+
+            if segment_index in self.rendered_segments:
+                return self.rendered_segments[segment_index]
+
+            if segment_index >= len(self.segments_to_render):
+                return None
+
+            if segment_index not in self.render_futures:
+                self._submit_segment_render(chapter, segment_index, attempt + 1)
+
+            future = self.render_futures[segment_index]
+
+            try:
+                result = future.result(timeout=timeout)
+                if result is not None:
+                    self.rendered_segments[segment_index] = result
+                    return result
+            except Exception as e:
+                logger.warning("Khong lay duoc segment %d: %s", segment_index, _format_exception(e))
+
+            attempt += 1
+            self.render_futures.pop(segment_index, None)
+            delay = _segment_retry_delay(attempt)
+            self.emit_event({
+                "type": "segment_retry",
+                "sessionId": self.id,
+                "chapterId": chapter.chapterId,
+                "chapterIndex": chapter.chapterIndex,
+                "segmentIndex": segment_index,
+                "totalSegments": self.total_segments,
+                "attempt": attempt + 1,
+                "message": f"Render lỗi, thử lại sau {delay:.1f}s",
+            })
+            if attempt == 1 or attempt % 5 == 0:
+                logger.warning(
+                    "Segment %d se retry lan %d sau %.1fs",
+                    segment_index,
+                    attempt,
+                    delay,
+                )
+            time.sleep(delay)
+
+        return None
 
 
 class SessionRegistry:
@@ -653,6 +1040,7 @@ class SessionRegistry:
             speed=request.speed,
             pitch=request.pitch,
             auto_next=request.autoNext,
+            start_segment_index=max(0, request.startSegmentIndex),
         )
         with self._lock:
             self._items[session.id] = session
@@ -698,6 +1086,11 @@ VIETNAMESE_VOICES = [
 @app.get("/voices")
 def list_voices() -> dict[str, Any]:
     return {"items": VIETNAMESE_VOICES, "defaultVoice": DEFAULT_VOICE}
+
+
+@app.get("/health")
+def health() -> dict[str, Any]:
+    return {"status": "ok", "sessions": registry.snapshot()["active"]}
 
 
 @app.post("/sessions")
@@ -760,6 +1153,12 @@ def skip_prev(session_id: str) -> dict[str, str]:
 def update_controls(session_id: str, controls: UpdateSessionControlsRequest) -> SessionResponse:
     session = registry.get(session_id)
     return session.update_controls(controls)
+
+
+@app.post("/sessions/{session_id}/seek")
+def seek_session(session_id: str, request: SeekSessionRequest) -> SessionResponse:
+    session = registry.get(session_id)
+    return session.seek(request)
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
