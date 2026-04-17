@@ -42,18 +42,10 @@ type Manager struct {
 
 	qrMu      sync.RWMutex
 	qrRuntime *telegramQRRuntime
-
-	streamMu      sync.RWMutex
-	streamRuntime map[string]*directTTSRuntime
 }
 
 type telegramQRRuntime struct {
 	session model.TelegramQRLogin
-	cancel  context.CancelFunc
-}
-
-type directTTSRuntime struct {
-	session model.DirectTTSSession
 	cancel  context.CancelFunc
 }
 
@@ -73,7 +65,6 @@ func NewManager(cfg config.Config, store *storage.Store, ttsProvider provider.Pr
 		tg:       tg,
 		chunker:  library.NewChunkPlanner(900),
 		queue:    make(chan int64, 32),
-		streamRuntime: make(map[string]*directTTSRuntime),
 	}, nil
 }
 
@@ -355,79 +346,6 @@ func (m *Manager) SaveReaderProgress(ctx context.Context, progress model.ReaderP
 		return model.ReaderProgress{}, err
 	}
 	return m.store.GetReaderProgress(ctx, progress.StoryID)
-}
-
-func (m *Manager) SpeakChapterDirect(ctx context.Context, chapterID int64, req model.DirectTTSRequest) (model.DirectTTSSession, error) {
-	chapter, err := m.store.GetChapter(ctx, chapterID)
-	if err != nil {
-		return model.DirectTTSSession{}, err
-	}
-	story, err := m.store.GetStory(ctx, chapter.StoryID)
-	if err != nil {
-		return model.DirectTTSSession{}, err
-	}
-
-	preset := chapter.Preset
-	if req.Preset != "" {
-		preset = req.Preset
-	}
-	voice := strings.TrimSpace(req.Voice)
-	if voice == "" {
-		voice = m.cfg.Edge.DefaultVoice
-	}
-
-	cacheKey := checksumText(chapter.Checksum + "|" + string(preset) + "|" + voice)
-	paths := library.ResolveStoryPaths(m.cfg.LibraryDir, story.Slug)
-	if err := library.EnsureStoryDirs(paths); err != nil {
-		return model.DirectTTSSession{}, err
-	}
-
-	plans := m.audioChunkPlans(chapter.NormalizedText)
-	if len(plans) == 0 {
-		return model.DirectTTSSession{}, fmt.Errorf("chuong %d khong co noi dung de synthesize", chapter.ChapterIndex)
-	}
-
-	sessionID := checksumText(fmt.Sprintf("%d|%s|%d", chapter.ID, cacheKey, time.Now().UnixNano()))
-	runtimeCtx, cancel := context.WithCancel(context.Background())
-	startedAt := time.Now()
-
-	session := model.DirectTTSSession{
-		ID:           sessionID,
-		StoryID:      story.ID,
-		ChapterID:    chapter.ID,
-		ChapterTitle: chapter.Title,
-		Status:       "generating",
-		Preset:       preset,
-		Voice:        voice,
-		TotalChunks:  len(plans),
-		ReadyChunks:  0,
-		CurrentChunk: 0,
-		Chunks:       make([]model.DirectTTSChunk, 0, len(plans)),
-		StartedAt:    startedAt,
-		UpdatedAt:    startedAt,
-	}
-	for _, plan := range plans {
-		session.Chunks = append(session.Chunks, model.DirectTTSChunk{
-			Index:     plan.Index,
-			WordCount: len(strings.Fields(plan.Text)),
-			Status:    "queued",
-		})
-	}
-
-	m.streamMu.Lock()
-	m.streamRuntime[sessionID] = &directTTSRuntime{
-		session: session,
-		cancel:  cancel,
-	}
-	m.streamMu.Unlock()
-
-	go m.runDirectTTSSession(runtimeCtx, sessionID, paths, story, chapter, preset, voice, cacheKey, plans)
-
-	return m.snapshotDirectTTSSession(sessionID)
-}
-
-func (m *Manager) GetDirectTTSSession(_ context.Context, sessionID string) (model.DirectTTSSession, error) {
-	return m.snapshotDirectTTSSession(sessionID)
 }
 
 func (m *Manager) QueueBuildStory(ctx context.Context, storyID int64, preset model.ProsodyPreset) (model.BuildJob, error) {
@@ -869,132 +787,9 @@ func stableStorySlug(relativePath, title string) string {
 	return fmt.Sprintf("%s-%s", base, checksumText(relativePath)[:8])
 }
 
-func directAudioFileName(chapter model.Chapter, preset model.ProsodyPreset, voice string) string {
-	return fmt.Sprintf("%03d-%s-%s-%s.mp3",
-		chapter.ChapterIndex,
-		library.Slugify(chapter.Title),
-		library.Slugify(string(preset)),
-		checksumText(voice)[:6],
-	)
-}
-
-func directChunkFileName(chapter model.Chapter, preset model.ProsodyPreset, voice string, chunkIndex int) string {
-	return fmt.Sprintf("%03d-%s-%s-%s-part-%04d.mp3",
-		chapter.ChapterIndex,
-		library.Slugify(chapter.Title),
-		library.Slugify(string(preset)),
-		checksumText(voice)[:6],
-		chunkIndex,
-	)
-}
-
 func checksumText(value string) string {
 	sum := sha1.Sum([]byte(value))
 	return hex.EncodeToString(sum[:])
-}
-
-func (m *Manager) audioChunkPlans(text string) []model.ChunkPlan {
-	planner := library.NewChunkPlanner(3600)
-	planner.MaxWords = 500
-	return planner.Plan(sanitizeTTSInput(text))
-}
-
-func (m *Manager) snapshotDirectTTSSession(sessionID string) (model.DirectTTSSession, error) {
-	m.streamMu.RLock()
-	runtime, ok := m.streamRuntime[sessionID]
-	if !ok {
-		m.streamMu.RUnlock()
-		return model.DirectTTSSession{}, fmt.Errorf("khong tim thay phien audio")
-	}
-	session := runtime.session
-	session.Chunks = append([]model.DirectTTSChunk(nil), runtime.session.Chunks...)
-	m.streamMu.RUnlock()
-	return session, nil
-}
-
-func (m *Manager) updateDirectTTSSession(sessionID string, update func(session *model.DirectTTSSession)) {
-	m.streamMu.Lock()
-	defer m.streamMu.Unlock()
-	runtime, ok := m.streamRuntime[sessionID]
-	if !ok {
-		return
-	}
-	update(&runtime.session)
-	runtime.session.UpdatedAt = time.Now()
-}
-
-func (m *Manager) runDirectTTSSession(ctx context.Context, sessionID string, paths library.StoryPaths, story model.Story, chapter model.Chapter, preset model.ProsodyPreset, voice, cacheKey string, plans []model.ChunkPlan) {
-	chunkDir := filepath.Join(paths.ArtifactChapters, "chunks", cacheKey[:12])
-	if err := os.MkdirAll(chunkDir, 0o755); err != nil {
-		m.updateDirectTTSSession(sessionID, func(session *model.DirectTTSSession) {
-			session.Status = "failed"
-			session.LastError = err.Error()
-		})
-		return
-	}
-
-	outputs := make([]string, 0, len(plans))
-	for _, plan := range plans {
-		select {
-		case <-ctx.Done():
-			m.updateDirectTTSSession(sessionID, func(session *model.DirectTTSSession) {
-				session.Status = "cancelled"
-			})
-			return
-		default:
-		}
-
-		chunkFile := filepath.Join(chunkDir, directChunkFileName(chapter, preset, voice, plan.Index))
-		chunkURL := toLibraryURL(m.cfg.LibraryDir, chunkFile)
-		m.updateDirectTTSSession(sessionID, func(session *model.DirectTTSSession) {
-			session.CurrentChunk = plan.Index + 1
-			session.Chunks[plan.Index].Status = "generating"
-		})
-
-		cacheHit := false
-		if stat, statErr := os.Stat(chunkFile); statErr == nil && stat.Size() > 0 {
-			cacheHit = true
-		} else {
-			if err := m.synthesizeWithFallback(ctx, plan.Text, chunkFile, voice, preset, 0); err != nil {
-				m.updateDirectTTSSession(sessionID, func(session *model.DirectTTSSession) {
-					session.Status = "failed"
-					session.LastError = fmt.Sprintf("part %d that bai: %v", plan.Index+1, err)
-					session.Chunks[plan.Index].Status = "failed"
-					session.Chunks[plan.Index].Error = err.Error()
-				})
-				return
-			}
-		}
-
-		outputs = append(outputs, chunkFile)
-		m.updateDirectTTSSession(sessionID, func(session *model.DirectTTSSession) {
-			session.ReadyChunks++
-			session.Chunks[plan.Index].Status = "ready"
-			session.Chunks[plan.Index].AudioURL = chunkURL
-			session.Chunks[plan.Index].CacheHit = cacheHit
-			session.Chunks[plan.Index].Error = ""
-			if session.ReadyChunks == session.TotalChunks {
-				session.Status = "completed"
-			}
-		})
-	}
-
-	audioFile := filepath.Join(paths.ArtifactChapters, directAudioFileName(chapter, preset, voice))
-	if len(outputs) == 1 {
-		_ = copyFile(outputs[0], audioFile)
-	} else if len(outputs) > 1 {
-		_ = m.merger.MergeMP3(context.Background(), outputs, audioFile)
-	}
-
-	chapterIDPtr := chapter.ID
-	_ = m.store.UpsertArtifact(context.Background(), model.Artifact{
-		StoryID:    story.ID,
-		ChapterID:  &chapterIDPtr,
-		Kind:       model.ArtifactKindChapterMP3,
-		FilePath:   audioFile,
-		Checksum:   cacheKey,
-		DurationMS: 0,
-	})
 }
 
 func (m *Manager) synthesizeWithFallback(ctx context.Context, text, outputPath, voice string, preset model.ProsodyPreset, depth int) error {
@@ -1217,15 +1012,6 @@ func splitHardClause(text string, limit int) []string {
 		out = append(out, strings.TrimSpace(current.String()))
 	}
 	return out
-}
-
-func toLibraryURL(libraryDir, filePath string) string {
-	normalizedPath := filepath.ToSlash(filePath)
-	normalizedRoot := filepath.ToSlash(libraryDir)
-	if !strings.HasPrefix(normalizedPath, normalizedRoot) {
-		return ""
-	}
-	return "/library/" + strings.TrimPrefix(strings.TrimPrefix(normalizedPath, normalizedRoot), "/")
 }
 
 func copyFile(src, dst string) error {

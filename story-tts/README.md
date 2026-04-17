@@ -84,13 +84,13 @@ npm install
 npm run dev
 ```
 
-Frontend dev bằng Vite sẽ chạy ở `http://127.0.0.1:5173`.
+Frontend dev bằng Vite sẽ chạy ở `http://127.0.0.1:5174`.
 
 ### Thứ tự nên chạy
 1. Mở terminal 1 chạy `tts_service`.
 2. Mở terminal 2 chạy `backend`.
 3. Mở terminal 3 chạy `frontend`.
-4. Mở `http://127.0.0.1:5173`.
+4. Mở `http://127.0.0.1:5174`.
 
 ## Chạy bằng Docker local
 ```powershell
@@ -115,12 +115,12 @@ docker compose down
 ```
 
 ## Lưu ý vận hành
-- Backend Go mặc định chạy ở `:18080`, realtime TTS service chạy ở `http://127.0.0.1:8010`, frontend dev mặc định ở `:5173`.
+- Backend Go mặc định chạy ở `:18080`, realtime TTS service chạy ở `http://127.0.0.1:8010`, frontend dev mặc định ở `:5174`.
 - `go run ./cmd/api` có thể mất vài giây đầu để build rồi mới bind cổng `18080`; nếu vừa chạy xong mà probe chưa thấy cổng mở ngay thì chờ thêm một chút.
 - `tts_service` hiện render audio trực tiếp bằng thư viện `edge_tts` của Python và có endpoint `GET /health` để `run.ps1` kiểm tra service đã sẵn sàng.
-- Playback realtime luôn đi đúng tuần tự segment; nếu segment hiện tại render lỗi thì service sẽ retry với backoff cho tới khi thành công hoặc người dùng dừng/skip session.
+- Playback realtime luôn đi đúng tuần tự segment; nếu segment hiện tại render lỗi thì service sẽ retry với backoff cho tới khi thành công hoặc người dùng dừng session, không tự bỏ qua segment lỗi.
 - Khi chạy Docker, frontend dùng Nginx static container ở `:4173` và reverse proxy `/api`, `/health`, `/library` sang backend container.
-- Tách Docker frontend khỏi `:5173` để tránh mở nhầm bundle cũ khi đang phát triển bằng `npm run dev`.
+- Tách Docker frontend khỏi `:5174` để tránh mở nhầm bundle cũ khi đang phát triển bằng `npm run dev`.
 - Trong Docker local, backend trả `realtimeTtsBaseUrl=http://localhost:8010` để browser trên máy host kết nối trực tiếp sang realtime TTS service.
 - Dữ liệu runtime mặc định nằm tại `data/` và thư viện truyện nằm tại `library/`.
 - Trên `Chrome/Edge`, app ưu tiên `showDirectoryPicker` để nhớ quyền truy cập thư mục; khi đó nút `Làm mới thư viện` sẽ quét lại đúng thư mục cũ và nhận chương mới vừa thêm.
@@ -130,11 +130,13 @@ docker compose down
 - Reader sẽ tự format nội dung theo nhịp khoảng `3-4 câu/đoạn` để dễ đọc hơn.
 - Reader dùng chữ không chân, cho phép tăng giảm cỡ chữ ngay trong màn hình đọc và giữ lại lựa chọn cỡ chữ ở local.
 - Frontend gọi trực tiếp realtime service bằng `HTTP + WebSocket`, nhận chunk `audio/mpeg` và phát liền mạch qua `MediaSource`.
-- UI player giữ nguyên chapter người dùng đang xem, không tự nhảy sang chapter kế tiếp chỉ vì backend đã bắt đầu render ahead.
-- Khi bắt đầu đọc thật sang chapter mới, reader sẽ tự đồng bộ sang đúng chapter đang phát; chỉ phần render ahead mới không ép UI nhảy chapter.
-- Panel realtime hiển thị theo từng chapter: chapter đang đọc và chapter đang render tiếp, cùng trạng thái segment `đã tách / đang tạo / retry / sẵn sàng / đang đọc / đã đọc`.
-- Có thể click trực tiếp vào bất kỳ segment nào trong panel để restart phiên đọc từ đúng chapter/segment đó.
-- Nếu session realtime hiện tại vẫn còn sống và segment đã được render trong chapter đó, thao tác click segment sẽ `seek` ngay trong session hiện tại và ưu tiên dùng lại audio cache thay vì tạo lại session mới.
+- UI không tự nhảy chapter chỉ vì backend render ahead. Reader chỉ tự chuyển chapter khi `audio đang phát thực tế` đã sang chapter mới.
+- Nút `Trước/Sau` khi realtime đang chạy chỉ đổi chapter hiển thị trong reader, không restart session realtime và không làm render lại pipeline hiện tại.
+- Panel realtime của chapter đang mở hiển thị toàn bộ các segment đã được nạp/render tính từ đoạn bắt đầu đọc, để theo dõi rõ audio đã tạo tới đâu và đang phát tới đâu.
+- Panel realtime được nhóm theo từng chapter để nhìn rõ đã nạp/render tới chapter nào, chapter nào đang phát và chapter nào đã hoàn tất.
+- Mỗi segment có progress bar riêng cho `tạo audio` và `đang đọc`, giúp nhìn rõ voice đang đọc tới đâu và audio đã render tới đâu trong chapter hiện tại.
+- Có thể click trực tiếp vào bất kỳ segment nào trong panel để nhảy tới đúng chapter/segment; nếu audio của segment đó đã render xong thì frontend/service sẽ ưu tiên tái dùng cache hiện có thay vì render lại từ đầu.
+- Service realtime dùng cơ chế `15 / 10 / 10`: khởi tạo trước `15` segment tính từ vị trí bắt đầu đọc; khi phần ahead còn khoảng `10` segment thì nạp tiếp `10` segment kế tiếp.
 - Có nút `Đọc từ bôi chọn` trong reader để lấy vùng người dùng đang chọn, map về segment tương ứng và tiếp tục đọc từ đó.
 - Highlight trong reader chuyển sang mức `từng chữ` dựa trên segment đang phát và tiến độ audio ước lượng, thay vì tô cả đoạn/block như trước.
 - Khi đọc xong một chương, session realtime sẽ tự chuyển sang chương kế tiếp cho tới hết truyện.

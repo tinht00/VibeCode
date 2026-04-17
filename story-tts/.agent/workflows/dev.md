@@ -21,7 +21,7 @@ Ghi nhanh cách chạy local và các lệnh kiểm tra cơ bản của dự án
 - Cổng mặc định:
   - TTS service: `8010`
   - Backend: `18080`
-  - Frontend: `5173`
+  - Frontend: `5174`
 - Env quan trọng:
   - `STORY_TTS_LIBRARY_DIR`
   - `STORY_TTS_FFMPEG_PATH`

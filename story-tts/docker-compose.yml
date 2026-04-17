@@ -32,6 +32,9 @@ services:
       STORY_TTS_EDGE_BINARY: edge-tts
       STORY_TTS_EDGE_VOICE: vi-VN-NamMinhNeural
       STORY_TTS_EDGE_OUTPUT_FORMAT: audio-24khz-48kbitrate-mono-mp3
+      # NOTE: realtimeTTSBaseURL phải là localhost:8010 để frontend (chạy trên browser của host)
+      # có thể kết nối tới TTS service đã được expose qua Docker port mapping.
+      # KHÔNG đổi thành tts_service:8010 vì browser không thể resolve Docker service names.
       STORY_TTS_REALTIME_TTS_BASE_URL: http://localhost:8010
       STORY_TTS_REALTIME_TTS_VOICE: vi-VN-NamMinhNeural
       STORY_TTS_REALTIME_TTS_SPEED: 0
@@ -54,6 +57,6 @@ services:
     depends_on:
       - backend
     ports:
-      # Giữ 5173 cho Vite dev server để source local không bị Docker frontend đè lên.
+      # Giữ 5174 cho Vite dev server để source local không bị Docker frontend đè lên.
       - "4173:80"
     restart: unless-stopped

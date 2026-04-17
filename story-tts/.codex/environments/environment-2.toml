@@ -6,11 +6,6 @@ name = "story-tts"
 script = "powershell -ExecutionPolicy Bypass -File .codex/environments/setup.ps1"
 
 [[actions]]
-name = "story-tts"
-icon = "run"
-command = "powershell -ExecutionPolicy Bypass -File .codex/environments/setup.ps1"
-
-[[actions]]
 name = "r"
 icon = "run"
 command = "powershell -ExecutionPolicy Bypass -Command \"& .\\.codex\\environments\\setup.ps1; & .\\run.ps1\""

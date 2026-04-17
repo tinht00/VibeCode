@@ -20,7 +20,7 @@
 - Bài toán chính là đọc truyện dài, nên thiết kế phải có chunking an toàn, retry từng phần và trạng thái job rõ ràng.
 
 ## 4. Quy ước môi trường
-- Cổng local: backend `18080`, frontend `5173`
+- Cổng local: backend `18080`, frontend `5174`
 - Env quan trọng: dự kiến gồm biến cho provider TTS, thư mục input TXT, thư mục output audio và binary `ffmpeg`
 - Service phụ thuộc: `NotebookLM`, provider TTS, `ffmpeg`; database/queue sẽ chốt khi có implementation thật
 

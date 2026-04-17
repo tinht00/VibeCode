@@ -33,8 +33,6 @@ func NewRouter(manager *service.Manager) *gin.Engine {
 		api.GET("/reader/progress/:storyId", server.getReaderProgress)
 		api.POST("/reader/progress", server.saveReaderProgress)
 		api.POST("/reader/edge-read-aloud/toggle", server.toggleEdgeReadAloud)
-		api.POST("/reader/chapters/:id/speak", server.speakChapterDirect)
-		api.GET("/reader/sessions/:id", server.getDirectTTSSession)
 		api.POST("/stories/scan", server.scanStory)
 		api.GET("/stories/:id", server.getStory)
 		api.POST("/stories/:id/build", server.buildStory)
@@ -141,31 +139,6 @@ func (s *Server) getChapterContent(c *gin.Context) {
 	c.JSON(http.StatusOK, item)
 }
 
-func (s *Server) speakChapterDirect(c *gin.Context) {
-	chapterID, err := parseID(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "id khong hop le"})
-		return
-	}
-	var req model.DirectTTSRequest
-	_ = c.ShouldBindJSON(&req)
-	item, err := s.manager.SpeakChapterDirect(c.Request.Context(), chapterID, req)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, item)
-}
-
-func (s *Server) getDirectTTSSession(c *gin.Context) {
-	item, err := s.manager.GetDirectTTSSession(c.Request.Context(), c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, item)
-}
-
 func (s *Server) buildStory(c *gin.Context) {
 	storyID, err := parseID(c.Param("id"))
 	if err != nil {
@@ -254,7 +227,7 @@ $wshell.SendKeys('^+u')
 	cmd := exec.Command("powershell", "-NoProfile", "-Command", script)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Không gửi được phím tắt Edge Read Aloud",
+			"error":  "Không gửi được phím tắt Edge Read Aloud",
 			"detail": string(output),
 		})
 		return

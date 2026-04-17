@@ -1,1 +1,1 @@
-{"root":["./src/main.ts","./src/types.ts","./src/lib/api.ts","./src/app.vue"],"version":"5.9.3"}
+{"root":["./src/main.ts","./src/types.ts","./src/lib/api.ts","./src/lib/toast.ts","./src/lib/websocket.ts","./src/app.vue","./src/components/readertextpane.vue","./src/components/segmentstatuspanel.vue","./src/components/toastcontainer.vue"],"version":"5.9.3"}

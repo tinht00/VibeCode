@@ -85,7 +85,7 @@ function Get-FrontendDevPort {
 
     $packageJsonPath = Join-Path $FrontendDir "package.json"
     if (-not (Test-Path $packageJsonPath)) {
-        return 5173
+        return 5174
     }
 
     $packageJson = Get-Content $packageJsonPath -Raw | ConvertFrom-Json
@@ -95,7 +95,7 @@ function Get-FrontendDevPort {
         return [int]$match.Groups[1].Value
     }
 
-    return 5173
+    return 5174
 }
 
 function Start-DevWindow {

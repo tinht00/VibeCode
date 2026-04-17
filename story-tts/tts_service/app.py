@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import queue
 import re
+import subprocess
 import tempfile
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -22,7 +25,16 @@ from pydantic import BaseModel
 logger = logging.getLogger("story_tts_realtime")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="story-tts-realtime", version="0.2.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: nothing special needed
+    yield
+    # Shutdown: clean up all sessions
+    registry.cleanup_all()
+
+
+app = FastAPI(title="story-tts-realtime", version="0.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -117,7 +129,9 @@ def split_chapter_into_segments(text: str) -> list[str]:
         return []
 
     # Tách thành các đoạn văn lớn (giữ \n\n làm boundary)
-    paragraphs = [part.strip() for part in re.split(r"\n{2,}", normalized) if part.strip()]
+    paragraphs = [
+        part.strip() for part in re.split(r"\n{2,}", normalized) if part.strip()
+    ]
     if not paragraphs:
         return []
 
@@ -157,23 +171,25 @@ def split_chapter_into_segments(text: str) -> list[str]:
 
         # Tìm dấu ngắt câu gần nhất trong khoảng ±20 từ từ target_end
         best_split = target_end
-        
+
         # Xác định khoảng tìm kiếm: từ (target_end - 20) đến (target_end + 20)
-        search_window_start = max(word_idx + max_words - 20, word_idx + 50)  # Tối thiểu 50 từ
+        search_window_start = max(
+            word_idx + max_words - 20, word_idx + 50
+        )  # Tối thiểu 50 từ
         search_window_end = min(target_end + 20, len(all_words))
-        
+
         if search_window_start < target_end:
             # Gộp text trong khoảng tìm kiếm
             search_text = " ".join(all_words[word_idx:search_window_end])
-            
+
             # Tìm dấu ngắt câu ưu tiên: . ! ? > , ; : > …
-            breakpoint_chars = ['.', '!', '?', ',', ';', ':', '…']
+            breakpoint_chars = [".", "!", "?", ",", ";", ":", "…"]
             best_break_pos = -1
-            
+
             # Tìm trong khoảng từ (max_words - 20) đến (max_words + 20) từ
             min_words_in_segment = max_words - 20
             max_words_in_segment = max_words + 20
-            
+
             for break_char in breakpoint_chars:
                 # Tìm tất cả vị trí của break_char
                 start_pos = 0
@@ -181,24 +197,24 @@ def split_chapter_into_segments(text: str) -> list[str]:
                     pos = search_text.find(break_char, start_pos)
                     if pos == -1:
                         break
-                    
+
                     # Đếm số từ trước vị trí này
-                    words_before = len(search_text[:pos+1].split())
-                    
+                    words_before = len(search_text[: pos + 1].split())
+
                     # Kiểm tra xem có trong khoảng chấp nhận được không
                     if min_words_in_segment <= words_before <= max_words_in_segment:
                         # Ưu tiên dấu câu mạnh (. ! ?) hơn (, ; :)
-                        if break_char in '.!?':
+                        if break_char in ".!?":
                             best_break_pos = pos
                             break  # Tìm thấy dấu mạnh, dừng ngay
-                        elif best_break_pos == -1 or break_char not in ',;:…':
+                        elif best_break_pos == -1 or break_char not in ",;:…":
                             best_break_pos = pos
-                    
+
                     start_pos = pos + 1
-            
+
             if best_break_pos > 0:
                 # Tính lại word index tại vị trí break
-                text_before_break = search_text[:best_break_pos+1]
+                text_before_break = search_text[: best_break_pos + 1]
                 words_in_segment = len(text_before_break.split())
                 best_split = word_idx + words_in_segment
 
@@ -213,7 +229,9 @@ def split_chapter_into_segments(text: str) -> list[str]:
         segments.append(segment_text)
         word_idx = best_split
 
-    logger.info("Chapter split into %d segments (word-based: 150/200 words)", len(segments))
+    logger.info(
+        "Chapter split into %d segments (word-based: 150/200 words)", len(segments)
+    )
     return segments
 
 
@@ -271,7 +289,9 @@ def split_into_segments(text: str, max_chars: int = 600) -> list[str]:
     if not normalized:
         return []
 
-    paragraphs = [part.strip() for part in re.split(r"\n{2,}", normalized) if part.strip()]
+    paragraphs = [
+        part.strip() for part in re.split(r"\n{2,}", normalized) if part.strip()
+    ]
     if not paragraphs:
         return []
 
@@ -280,7 +300,7 @@ def split_into_segments(text: str, max_chars: int = 600) -> list[str]:
         if len(paragraph) <= max_chars:
             segments.append(paragraph)
         else:
-            sentences = re.split(r'(?<=[.!?])\s+', paragraph)
+            sentences = re.split(r"(?<=[.!?])\s+", paragraph)
             current = ""
             for sentence in sentences:
                 if len(current) + len(sentence) <= max_chars:
@@ -322,6 +342,37 @@ def _format_exception(exc: Exception) -> str:
 
 def _segment_retry_delay(attempt: int) -> float:
     return min(8.0, 0.8 * attempt)
+
+
+def probe_audio_duration_seconds(file_path: str) -> float:
+    """
+    Lấy thời lượng thực của file audio bằng ffprobe.
+    Fallback trả 0 nếu không probe được, để caller dùng ước lượng cũ.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_format",
+                file_path,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=8,
+        )
+        payload = json.loads(result.stdout or "{}")
+        duration_raw = payload.get("format", {}).get("duration")
+        duration = float(duration_raw)
+        if duration > 0:
+            return duration
+    except Exception as exc:
+        logger.debug("ffprobe khong lay duoc duration cho %s: %s", file_path, exc)
+    return 0.0
 
 
 async def _save_audio_with_edge_tts(
@@ -384,12 +435,17 @@ def synthesize_segment_edge_tts(
             if file_size == 0:
                 raise RuntimeError("edge_tts tạo file audio rỗng")
 
-            # Ước lượng thời lượng: MP3 24kHz mono ~24kbps = 3KB/s
-            # Thực tế edge-tts 24khz 48kbitrate = 6KB/s
-            bytes_per_second = 6000
-            estimated_duration = file_size / bytes_per_second
+            actual_duration = probe_audio_duration_seconds(output_path)
+            if actual_duration > 0:
+                estimated_duration = actual_duration
+            else:
+                # Fallback khi ffprobe không đọc được duration.
+                bytes_per_second = 6000
+                estimated_duration = file_size / bytes_per_second
 
-            logger.debug("Synthesized segment: %d bytes, %.1fs", file_size, estimated_duration)
+            logger.debug(
+                "Synthesized segment: %d bytes, %.1fs", file_size, estimated_duration
+            )
             return file_size, estimated_duration
 
         except TimeoutError:
@@ -407,7 +463,9 @@ def synthesize_segment_edge_tts(
             )
             time.sleep(0.4 * attempt)
 
-    raise RuntimeError(f"edge_tts lỗi sau {max_retries} lần thử: {_format_exception(last_error)}")
+    raise RuntimeError(
+        f"edge_tts lỗi sau {max_retries} lần thử: {_format_exception(last_error)}"
+    )
 
 
 # ─── Session Management ───────────────────────────────────────────────────────
@@ -416,6 +474,7 @@ def synthesize_segment_edge_tts(
 @dataclass
 class RenderedSegment:
     """Lưu kết quả render của một đoạn."""
+
     index: int
     audio_data: bytes
     duration_estimate: float
@@ -446,17 +505,37 @@ class RuntimeSession:
     current_stream: Any = None
     lock: threading.RLock = field(default_factory=threading.RLock)
     closed: threading.Event = field(default_factory=threading.Event)
+    stream_epoch: int = 0
 
     # Pipeline rendering
-    render_executor: ThreadPoolExecutor = field(default_factory=lambda: ThreadPoolExecutor(max_workers=3))
-    segment_queue: queue.Queue = field(default_factory=queue.Queue)  # Queue chứa RenderedSegment
+    render_executor: ThreadPoolExecutor = field(
+        default_factory=lambda: ThreadPoolExecutor(max_workers=3)
+    )
     rendered_segments: dict[int, RenderedSegment] = field(default_factory=dict)
     render_futures: dict[int, Future] = field(default_factory=dict)
-    pipeline_window: int = 3  # Số đoạn render trước
+    chapter_rendered_cache: dict[int, dict[int, RenderedSegment]] = field(
+        default_factory=dict
+    )
+    chapter_segment_text_cache: dict[int, list[str]] = field(default_factory=dict)
+    chapter_prefetched_until_cache: dict[int, int] = field(default_factory=dict)
+    pipeline_initial_window: int = 15
+    pipeline_refill_threshold: int = 10
+    pipeline_refill_batch: int = 10
+    prefetched_until_index: int = -1
     current_segment_index: int = 0
     total_segments: int = 0
-    segments_to_render: list[str] = field(default_factory=list)  # Danh sách text các đoạn
+    segments_to_render: list[str] = field(
+        default_factory=list
+    )  # Danh sách text các đoạn
     initial_segment_anchor_used: bool = False
+
+    def close(self):
+        """Stop worker thread and shut down executor."""
+        self.stop()
+        try:
+            self.render_executor.shutdown(wait=False)
+        except Exception:
+            pass
 
     def to_response(self) -> SessionResponse:
         chapter = self.chapters[self.current_index]
@@ -482,20 +561,23 @@ class RuntimeSession:
             if self.worker and self.worker.is_alive():
                 return
             self.worker = threading.Thread(
-                target=self._run,
-                daemon=True,
-                name=f"tts-session-{self.id}"
+                target=self._run, daemon=True, name=f"tts-session-{self.id}"
             )
             self.worker.start()
             logger.info("Session %s da khoi dong worker", self.id)
 
     def stop(self) -> None:
+        with self.lock:
+            self.stream_epoch += 1
         self.stop_requested.set()
         self._stop_stream()
 
     def skip(self, delta: int) -> None:
         with self.lock:
-            target_index = max(0, min(self.current_index + delta, len(self.chapters) - 1))
+            self.stream_epoch += 1
+            target_index = max(
+                0, min(self.current_index + delta, len(self.chapters) - 1)
+            )
             self.pending_index = target_index
             self.pending_segment_index = 0
         self._stop_stream()
@@ -504,18 +586,137 @@ class RuntimeSession:
         with self.lock:
             try:
                 target_index = next(
-                    index for index, item in enumerate(self.chapters)
+                    index
+                    for index, item in enumerate(self.chapters)
                     if item.chapterId == request.chapterId
                 )
             except StopIteration as exc:
-                raise HTTPException(status_code=400, detail="Không tìm thấy chapterId để seek") from exc
+                raise HTTPException(
+                    status_code=400, detail="Không tìm thấy chapterId để seek"
+                ) from exc
 
+            self.stream_epoch += 1
             self.pending_index = target_index
             self.pending_segment_index = max(0, request.segmentIndex)
 
+            if self._try_emit_cached_seek(target_index, self.pending_segment_index):
+                return self.to_response()
+
+        # Cắt luồng hiện tại ngay để seek phản hồi nhanh, tương tự skip().
+        self._stop_stream()
         return self.to_response()
 
-    def update_controls(self, controls: UpdateSessionControlsRequest) -> SessionResponse:
+    def _next_position_after(
+        self, chapter_index: int, segment_index: int, total_segments: int
+    ) -> tuple[int, int] | None:
+        if segment_index + 1 < total_segments:
+            return (chapter_index, segment_index + 1)
+        if self.auto_next and chapter_index + 1 < len(self.chapters):
+            return (chapter_index + 1, 0)
+        return None
+
+    def _try_emit_cached_seek(self, target_index: int, segment_index: int) -> bool:
+        chapter = self.chapters[target_index]
+        chapter_cache = self.chapter_rendered_cache.get(chapter.chapterId, {})
+        rendered = chapter_cache.get(segment_index)
+        if rendered is None:
+            return False
+
+        segments = self.chapter_segment_text_cache.get(chapter.chapterId)
+        if not segments:
+            segments = split_chapter_into_segments(chapter.text)
+            self.chapter_segment_text_cache[chapter.chapterId] = segments
+        total_segments = len(segments)
+        if total_segments == 0:
+            return False
+
+        next_position = self._next_position_after(
+            target_index,
+            segment_index,
+            total_segments,
+        )
+        self.current_index = target_index
+        self.start_segment_index = segment_index
+        self.current_segment_index = segment_index
+        self.initial_segment_anchor_used = True
+        self.rendered_segments = dict(chapter_cache)
+        self.segments_to_render = segments
+        self.total_segments = total_segments
+        self.prefetched_until_index = max(
+            self.chapter_prefetched_until_cache.get(
+                chapter.chapterId, segment_index
+            ),
+            segment_index,
+        )
+        if next_position is None:
+            self.pending_index = None
+            self.pending_segment_index = None
+        else:
+            self.pending_index, self.pending_segment_index = next_position
+
+        self.emit_event(
+            {
+                "type": "chapter_segments",
+                "sessionId": self.id,
+                "chapterId": chapter.chapterId,
+                "chapterIndex": chapter.chapterIndex,
+                "chapterTitle": chapter.title,
+                "totalSegments": total_segments,
+                "segments": [
+                    {
+                        "index": index,
+                        "text": segment,
+                        "wordCount": len(segment.split()),
+                    }
+                    for index, segment in enumerate(segments)
+                ],
+                "startSegmentIndex": segment_index,
+            }
+        )
+        self.emit_event(
+            {
+                "type": "chapter_started",
+                "sessionId": self.id,
+                "storyId": self.story_id,
+                "chapterId": chapter.chapterId,
+                "chapterIndex": chapter.chapterIndex,
+                "chapterTitle": chapter.title,
+            }
+        )
+        self.emit_event(
+            {
+                "type": "segment_started",
+                "sessionId": self.id,
+                "chapterId": chapter.chapterId,
+                "chapterIndex": chapter.chapterIndex,
+                "segmentIndex": segment_index,
+                "totalSegments": total_segments,
+                "segmentText": rendered.text[:200],
+                "wordCount": len(rendered.text.split()),
+                "durationEstimate": rendered.duration_estimate,
+            }
+        )
+        self.emit_audio(rendered.audio_data)
+        self.emit_event(
+            {
+                "type": "segment_finished",
+                "sessionId": self.id,
+                "chapterId": chapter.chapterId,
+                "chapterIndex": chapter.chapterIndex,
+                "segmentIndex": segment_index,
+            }
+        )
+        logger.info(
+            "Fast seek cache hit: chapter=%d segment=%d, tiếp tục từ %s",
+            chapter.chapterIndex,
+            segment_index,
+            next_position,
+        )
+        return True
+
+    def update_controls(
+        self, controls: UpdateSessionControlsRequest
+    ) -> SessionResponse:
         with self.lock:
             if controls.voice is not None and controls.voice.strip():
                 self.voice = controls.voice.strip()
@@ -550,17 +751,17 @@ class RuntimeSession:
 
     def emit_event(self, payload: dict[str, Any]) -> None:
         self.updated_at = now_iso()
+        # Don't emit if session is closed or loop/outbox not ready
+        if self.closed.is_set():
+            return
         if not self.loop or not self.outbox:
-            logger.warning("Cannot emit event %s: loop=%s, outbox=%s",
-                         payload.get("type"), self.loop is not None, self.outbox is not None)
             return
         try:
             asyncio.run_coroutine_threadsafe(
-                self.outbox.put({"kind": "event", "payload": payload}),
-                self.loop
+                self.outbox.put({"kind": "event", "payload": payload}), self.loop
             )
         except Exception as e:
-            logger.error("Failed to emit event %s: %s", payload.get("type"), e)
+            logger.debug("Failed to emit event %s: %s", payload.get("type"), e)
 
     def emit_audio(self, payload: bytes) -> None:
         if not payload or not self.loop or not self.outbox:
@@ -605,19 +806,26 @@ class RuntimeSession:
                 with open(tmp_path, "rb") as f:
                     audio_data = f.read()
 
-                self.emit_event({
-                    "type": "segment_ready",
-                    "sessionId": self.id,
-                    "chapterId": chapter_id,
-                    "chapterIndex": chapter_index,
-                    "chapterTitle": chapter_title,
-                    "segmentIndex": segment_index,
-                    "totalSegments": self.total_segments,
-                    "segmentText": text[:200],
-                    "wordCount": len(text.split()),
-                    "durationEstimate": estimated_duration,
-                })
-                logger.debug("Rendered segment %d: %d bytes (%.1fs)", segment_index, file_size, estimated_duration)
+                self.emit_event(
+                    {
+                        "type": "segment_ready",
+                        "sessionId": self.id,
+                        "chapterId": chapter_id,
+                        "chapterIndex": chapter_index,
+                        "chapterTitle": chapter_title,
+                        "segmentIndex": segment_index,
+                        "totalSegments": self.total_segments,
+                        "segmentText": text[:200],
+                        "wordCount": len(text.split()),
+                        "durationEstimate": estimated_duration,
+                    }
+                )
+                logger.debug(
+                    "Rendered segment %d: %d bytes (%.1fs)",
+                    segment_index,
+                    file_size,
+                    estimated_duration,
+                )
                 return RenderedSegment(
                     index=segment_index,
                     audio_data=audio_data,
@@ -647,21 +855,26 @@ class RuntimeSession:
     ) -> None:
         if segment_index >= len(self.segments_to_render):
             return
-        if segment_index in self.rendered_segments or segment_index in self.render_futures:
+        if (
+            segment_index in self.rendered_segments
+            or segment_index in self.render_futures
+        ):
             return
 
         segment_text = self.segments_to_render[segment_index]
-        self.emit_event({
-            "type": "segment_rendering",
-            "sessionId": self.id,
-            "chapterId": chapter.chapterId,
-            "chapterIndex": chapter.chapterIndex,
-            "segmentIndex": segment_index,
-            "totalSegments": self.total_segments,
-            "segmentText": segment_text[:200],
-            "wordCount": len(segment_text.split()),
-            "attempt": attempt,
-        })
+        self.emit_event(
+            {
+                "type": "segment_rendering",
+                "sessionId": self.id,
+                "chapterId": chapter.chapterId,
+                "chapterIndex": chapter.chapterIndex,
+                "segmentIndex": segment_index,
+                "totalSegments": self.total_segments,
+                "segmentText": segment_text[:200],
+                "wordCount": len(segment_text.split()),
+                "attempt": attempt,
+            }
+        )
         future = self.render_executor.submit(
             self.render_single_segment,
             chapter.chapterId,
@@ -670,60 +883,128 @@ class RuntimeSession:
             segment_index,
             segment_text,
         )
+        def _store_render_result(done_future: Future) -> None:
+            try:
+                result = done_future.result()
+            except Exception:
+                return
+            if result is None:
+                return
+            with self.lock:
+                chapter_cache = self.chapter_rendered_cache.setdefault(
+                    chapter.chapterId, {}
+                )
+                chapter_cache[segment_index] = result
+                self.chapter_prefetched_until_cache[chapter.chapterId] = max(
+                    self.chapter_prefetched_until_cache.get(chapter.chapterId, -1),
+                    segment_index,
+                )
+                if (
+                    self.current_index < len(self.chapters)
+                    and self.chapters[self.current_index].chapterId
+                    == chapter.chapterId
+                ):
+                    self.rendered_segments[segment_index] = result
+
+        future.add_done_callback(_store_render_result)
         self.render_futures[segment_index] = future
 
-    def _ensure_pipeline_ahead(self, chapter: RealtimeChapterPayload, start_segment_index: int):
+    def _ensure_pipeline_ahead(
+        self,
+        chapter: RealtimeChapterPayload,
+        start_segment_index: int,
+        force_initial: bool = False,
+    ):
         """
-        Đảm bảo các đoạn từ start_segment_index đến start_segment_index + pipeline_window
-        đã được submit để render.
+        Giữ buffer render ahead theo cơ chế:
+        - Lần đầu nạp tối đa 15 segment tính từ vị trí bắt đầu.
+        - Khi số segment còn lại trong buffer chỉ còn 10, nạp thêm 10 segment.
         """
-        end_index = min(start_segment_index + self.pipeline_window, self.total_segments)
+        if start_segment_index >= self.total_segments:
+            return
 
-        for seg_idx in range(start_segment_index, end_index):
+        reset_window = force_initial or self.prefetched_until_index < (
+            start_segment_index - 1
+        )
+        if reset_window:
+            submission_start = start_segment_index
+            self.prefetched_until_index = start_segment_index - 1
+            batch_size = self.pipeline_initial_window
+        else:
+            remaining_buffer = self.prefetched_until_index - start_segment_index + 1
+            if remaining_buffer > self.pipeline_refill_threshold:
+                return
+            submission_start = self.prefetched_until_index + 1
+            batch_size = self.pipeline_refill_batch
+
+        end_index = min(submission_start + batch_size, self.total_segments)
+        if submission_start >= end_index:
+            return
+
+        for seg_idx in range(submission_start, end_index):
             self._submit_segment_render(chapter, seg_idx)
+        self.prefetched_until_index = max(self.prefetched_until_index, end_index - 1)
+        self.chapter_prefetched_until_cache[chapter.chapterId] = (
+            self.prefetched_until_index
+        )
 
     def _consume_same_chapter_seek(self, chapter: RealtimeChapterPayload) -> bool:
         with self.lock:
-            if self.pending_index != self.current_index or self.pending_segment_index is None:
+            if (
+                self.pending_index != self.current_index
+                or self.pending_segment_index is None
+            ):
                 return False
-            target_segment_index = max(0, min(self.pending_segment_index, self.total_segments - 1))
+            target_segment_index = max(
+                0, min(self.pending_segment_index, self.total_segments - 1)
+            )
             self.current_segment_index = target_segment_index
             self.pending_index = None
             self.pending_segment_index = None
 
-        self.emit_event({
-            "type": "chapter_segments",
-            "sessionId": self.id,
-            "chapterId": chapter.chapterId,
-            "chapterIndex": chapter.chapterIndex,
-            "chapterTitle": chapter.title,
-            "totalSegments": self.total_segments,
-            "segments": [
-                {
-                    "index": index,
-                    "text": segment,
-                    "wordCount": len(segment.split()),
-                }
-                for index, segment in enumerate(self.segments_to_render)
-            ],
-            "startSegmentIndex": target_segment_index,
-        })
+        self.emit_event(
+            {
+                "type": "chapter_segments",
+                "sessionId": self.id,
+                "chapterId": chapter.chapterId,
+                "chapterIndex": chapter.chapterIndex,
+                "chapterTitle": chapter.title,
+                "totalSegments": self.total_segments,
+                "segments": [
+                    {
+                        "index": index,
+                        "text": segment,
+                        "wordCount": len(segment.split()),
+                    }
+                    for index, segment in enumerate(self.segments_to_render)
+                ],
+                "startSegmentIndex": target_segment_index,
+            }
+        )
         return True
 
     def _run(self) -> None:
         try:
             self.status = "streaming"
-            self.emit_event({
-                "type": "session_started",
-                "sessionId": self.id,
-                "storyId": self.story_id,
-                "chapterId": self.chapters[self.current_index].chapterId,
-                "chapterIndex": self.chapters[self.current_index].chapterIndex,
-                "voice": self.voice,
-                "speed": self.speed,
-                "pitch": self.pitch,
-                "autoNext": self.auto_next,
-            })
+            logger.info(
+                "Worker _run() starting: session_id=%s, current_index=%d, start_segment_index=%d",
+                self.id,
+                self.current_index,
+                self.start_segment_index,
+            )
+            self.emit_event(
+                {
+                    "type": "session_started",
+                    "sessionId": self.id,
+                    "storyId": self.story_id,
+                    "chapterId": self.chapters[self.current_index].chapterId,
+                    "chapterIndex": self.chapters[self.current_index].chapterIndex,
+                    "voice": self.voice,
+                    "speed": self.speed,
+                    "pitch": self.pitch,
+                    "autoNext": self.auto_next,
+                }
+            )
             self.emit_event({"type": "audio_format", "mime": "audio/mpeg"})
             logger.info("Session %s setup complete, starting chapter loop", self.id)
 
@@ -741,15 +1022,19 @@ class RuntimeSession:
                     self.current_index = chapter_index
 
                 chapter = self.chapters[chapter_index]
-                logger.info("Starting chapter %d: %s", chapter.chapterIndex, chapter.title)
-                self.emit_event({
-                    "type": "chapter_started",
-                    "sessionId": self.id,
-                    "storyId": self.story_id,
-                    "chapterId": chapter.chapterId,
-                    "chapterIndex": chapter.chapterIndex,
-                    "chapterTitle": chapter.title,
-                })
+                logger.info(
+                    "Starting chapter %d: %s", chapter.chapterIndex, chapter.title
+                )
+                self.emit_event(
+                    {
+                        "type": "chapter_started",
+                        "sessionId": self.id,
+                        "storyId": self.story_id,
+                        "chapterId": chapter.chapterId,
+                        "chapterIndex": chapter.chapterIndex,
+                        "chapterTitle": chapter.title,
+                    }
+                )
 
                 stream_result = self._stream_chapter(chapter)
 
@@ -762,13 +1047,18 @@ class RuntimeSession:
                     if self.pending_index is not None:
                         target_index = self.pending_index
                         target_segment_index = self.pending_segment_index or 0
-                        self.emit_event({
-                            "type": "chapter_transition",
-                            "sessionId": self.id,
-                            "fromChapterId": chapter.chapterId,
-                            "toChapterId": self.chapters[target_index].chapterId,
-                            "reason": "seek" if target_segment_index > 0 or target_index != chapter_index else "skip",
-                        })
+                        self.emit_event(
+                            {
+                                "type": "chapter_transition",
+                                "sessionId": self.id,
+                                "fromChapterId": chapter.chapterId,
+                                "toChapterId": self.chapters[target_index].chapterId,
+                                "reason": "seek"
+                                if target_segment_index > 0
+                                or target_index != chapter_index
+                                else "skip",
+                            }
+                        )
                         chapter_index = target_index
                         self.start_segment_index = target_segment_index
                         self.initial_segment_anchor_used = False
@@ -779,12 +1069,14 @@ class RuntimeSession:
                 if stream_result == "skipped":
                     continue
 
-                self.emit_event({
-                    "type": "chapter_finished",
-                    "sessionId": self.id,
-                    "chapterId": chapter.chapterId,
-                    "chapterIndex": chapter.chapterIndex,
-                })
+                self.emit_event(
+                    {
+                        "type": "chapter_finished",
+                        "sessionId": self.id,
+                        "chapterId": chapter.chapterId,
+                        "chapterIndex": chapter.chapterIndex,
+                    }
+                )
                 if not self.auto_next:
                     self.status = "stopped"
                     self.emit_event({"type": "stopped", "sessionId": self.id})
@@ -792,31 +1084,39 @@ class RuntimeSession:
 
                 if chapter_index >= len(self.chapters) - 1:
                     self.status = "completed"
-                    self.emit_event({
-                        "type": "story_finished",
-                        "sessionId": self.id,
-                        "storyId": self.story_id,
-                    })
+                    self.emit_event(
+                        {
+                            "type": "story_finished",
+                            "sessionId": self.id,
+                            "storyId": self.story_id,
+                        }
+                    )
                     break
 
                 next_chapter = self.chapters[chapter_index + 1]
-                self.emit_event({
-                    "type": "chapter_transition",
-                    "sessionId": self.id,
-                    "fromChapterId": chapter.chapterId,
-                    "toChapterId": next_chapter.chapterId,
-                    "reason": "auto_next",
-                })
+                self.emit_event(
+                    {
+                        "type": "chapter_transition",
+                        "sessionId": self.id,
+                        "fromChapterId": chapter.chapterId,
+                        "toChapterId": next_chapter.chapterId,
+                        "reason": "auto_next",
+                    }
+                )
                 chapter_index += 1
 
         except Exception as exc:
             logger.exception("RealtimeTTS session lỗi")
             self.status = "failed"
             self.last_error = str(exc)
-            self.emit_event({"type": "error", "sessionId": self.id, "message": str(exc)})
+            self.emit_event(
+                {"type": "error", "sessionId": self.id, "message": str(exc)}
+            )
         finally:
             self.closed.set()
-            self.emit_event({"type": "stream_closed", "sessionId": self.id, "status": self.status})
+            self.emit_event(
+                {"type": "stream_closed", "sessionId": self.id, "status": self.status}
+            )
 
     def _stream_chapter(self, chapter: RealtimeChapterPayload) -> str:
         """
@@ -832,40 +1132,95 @@ class RuntimeSession:
             return "completed"
 
         # Setup pipeline state
+        self.chapter_segment_text_cache[chapter.chapterId] = segments
         self.segments_to_render = segments
         self.total_segments = len(segments)
-        if chapter.chapterId == self.chapters[self.current_index].chapterId and not self.initial_segment_anchor_used:
-            self.current_segment_index = max(0, min(self.start_segment_index, self.total_segments - 1))
+
+        # Log debug: check if start_segment_index will be applied
+        chapter_matches = (
+            chapter.chapterId == self.chapters[self.current_index].chapterId
+        )
+        logger.info(
+            "_stream_chapter: chapterId=%d, current_index=%d, current_chapterId=%d, matches=%s, start_segment_index=%d, initial_anchor_used=%s",
+            chapter.chapterId,
+            self.current_index,
+            self.chapters[self.current_index].chapterId,
+            chapter_matches,
+            self.start_segment_index,
+            self.initial_segment_anchor_used,
+        )
+
+        if (
+            chapter.chapterId == self.chapters[self.current_index].chapterId
+            and not self.initial_segment_anchor_used
+        ):
+            self.current_segment_index = max(
+                0, min(self.start_segment_index, self.total_segments - 1)
+            )
             self.initial_segment_anchor_used = True
+            logger.info(
+                "Applied start_segment_index: %d → current_segment_index: %d",
+                self.start_segment_index,
+                self.current_segment_index,
+            )
         else:
             self.current_segment_index = 0
-        self.rendered_segments.clear()
+            logger.info(
+                "Reset current_segment_index to 0 (chapter mismatch or anchor already used)"
+            )
+        cached_rendered = dict(self.chapter_rendered_cache.get(chapter.chapterId, {}))
+        self.rendered_segments = cached_rendered
         self.render_futures.clear()
+        cached_prefetched_until = self.chapter_prefetched_until_cache.get(
+            chapter.chapterId,
+            max(cached_rendered.keys(), default=self.current_segment_index - 1),
+        )
+        self.prefetched_until_index = max(
+            self.current_segment_index - 1,
+            cached_prefetched_until,
+        )
+        self.chapter_prefetched_until_cache[chapter.chapterId] = (
+            self.prefetched_until_index
+        )
 
-        logger.info("Chapter %d split into %d segments for pipeline synthesis",
-                   chapter.chapterIndex, len(segments))
-        self.emit_event({
-            "type": "chapter_segments",
-            "sessionId": self.id,
-            "chapterId": chapter.chapterId,
-            "chapterIndex": chapter.chapterIndex,
-            "chapterTitle": chapter.title,
-            "totalSegments": self.total_segments,
-            "segments": [
-                {
-                    "index": index,
-                    "text": segment,
-                    "wordCount": len(segment.split()),
-                }
-                for index, segment in enumerate(segments)
-            ],
-            "startSegmentIndex": self.current_segment_index,
-        })
+        logger.info(
+            "Chapter %d split into %d segments for pipeline synthesis",
+            chapter.chapterIndex,
+            len(segments),
+        )
+        self.emit_event(
+            {
+                "type": "chapter_segments",
+                "sessionId": self.id,
+                "chapterId": chapter.chapterId,
+                "chapterIndex": chapter.chapterIndex,
+                "chapterTitle": chapter.title,
+                "totalSegments": self.total_segments,
+                "segments": [
+                    {
+                        "index": index,
+                        "text": segment,
+                        "wordCount": len(segment.split()),
+                    }
+                    for index, segment in enumerate(segments)
+                ],
+                "startSegmentIndex": self.current_segment_index,
+            }
+        )
 
         interrupted = False
 
-        # Bắt đầu pipeline: render trước 3 đoạn đầu tiên
-        self._ensure_pipeline_ahead(chapter, 0)
+        # Bắt đầu pipeline: render sẵn tối đa 15 segment tính từ vị trí hiện tại.
+        logger.info(
+            "Starting pipeline from segment index %d (total: %d)",
+            self.current_segment_index,
+            self.total_segments,
+        )
+        self._ensure_pipeline_ahead(
+            chapter,
+            self.current_segment_index,
+            force_initial=True,
+        )
 
         # Đọc và phát tuần tự từng đoạn
         while self.current_segment_index < self.total_segments:
@@ -878,10 +1233,11 @@ class RuntimeSession:
             with self.lock:
                 if self.pending_index is not None:
                     return "skipped"
+                segment_epoch = self.stream_epoch
 
             seg_idx = self.current_segment_index
 
-            # Đảm bảo pipeline: render trước các đoạn ahead
+            # Khi buffer ahead chỉ còn 10 segment, nạp thêm 10 segment tiếp theo.
             self._ensure_pipeline_ahead(chapter, seg_idx + 1)
 
             # Chờ segment hiện tại được render xong
@@ -898,17 +1254,22 @@ class RuntimeSession:
                 continue
 
             # Phát audio segment đã render
-            self.emit_event({
-                "type": "segment_started",
-                "sessionId": self.id,
-                "chapterId": chapter.chapterId,
-                "chapterIndex": chapter.chapterIndex,
-                "segmentIndex": seg_idx,
-                "totalSegments": self.total_segments,
-                "segmentText": rendered.text[:200],
-                "wordCount": len(rendered.text.split()),
-                "durationEstimate": rendered.duration_estimate,
-            })
+            with self.lock:
+                if segment_epoch != self.stream_epoch:
+                    return "skipped"
+            self.emit_event(
+                {
+                    "type": "segment_started",
+                    "sessionId": self.id,
+                    "chapterId": chapter.chapterId,
+                    "chapterIndex": chapter.chapterIndex,
+                    "segmentIndex": seg_idx,
+                    "totalSegments": self.total_segments,
+                    "segmentText": rendered.text[:200],
+                    "wordCount": len(rendered.text.split()),
+                    "durationEstimate": rendered.duration_estimate,
+                }
+            )
 
             # Gửi audio data
             chunk_size = 4096
@@ -918,10 +1279,13 @@ class RuntimeSession:
                     interrupted = True
                     break
                 with self.lock:
-                    if self.pending_index is not None:
+                    if (
+                        self.pending_index is not None
+                        or segment_epoch != self.stream_epoch
+                    ):
                         interrupted_by_seek = True
                         break
-                chunk = rendered.audio_data[offset:offset + chunk_size]
+                chunk = rendered.audio_data[offset : offset + chunk_size]
                 self.emit_audio(chunk)
                 # Sleep nhỏ để tránh gửi quá nhanh
                 time.sleep(0.001)
@@ -934,20 +1298,26 @@ class RuntimeSession:
                     continue
                 return "skipped"
 
-            self.emit_event({
-                "type": "segment_finished",
-                "sessionId": self.id,
-                "chapterId": chapter.chapterId,
-                "chapterIndex": chapter.chapterIndex,
-                "segmentIndex": seg_idx,
-            })
+            self.emit_event(
+                {
+                    "type": "segment_finished",
+                    "sessionId": self.id,
+                    "chapterId": chapter.chapterId,
+                    "chapterIndex": chapter.chapterIndex,
+                    "segmentIndex": seg_idx,
+                }
+            )
 
             self.render_futures.pop(seg_idx, None)
 
             self.current_segment_index += 1
 
-        logger.info("Chapter %d finished: %d/%d segments synthesized",
-                   chapter.chapterIndex, self.current_segment_index, self.total_segments)
+        logger.info(
+            "Chapter %d finished: %d/%d segments synthesized",
+            chapter.chapterIndex,
+            self.current_segment_index,
+            self.total_segments,
+        )
         if interrupted:
             return "stopped"
         return "completed"
@@ -962,10 +1332,15 @@ class RuntimeSession:
         Chờ một segment được render xong.
         Nếu đã có trong cache thì trả về ngay.
         Nếu render lỗi thì submit lại cho tới khi thành công hoặc session bị dừng.
+
+        === FIX: Poll pending_index every 100ms instead of blocking for 90s ===
+        This allows seek requests to be processed nhanh hơn khi người dùng click segment.
         """
         attempt = 0
+        poll_interval = 0.1  # Check pending_index every 100ms
 
         while not self.stop_requested.is_set():
+            # === FIX: Check pending_index BEFORE waiting ===
             with self.lock:
                 if self.pending_index is not None:
                     return None
@@ -981,27 +1356,36 @@ class RuntimeSession:
 
             future = self.render_futures[segment_index]
 
+            # === FIX: Use short timeout polling instead of blocking 90s ===
             try:
-                result = future.result(timeout=timeout)
+                result = future.result(timeout=poll_interval)
                 if result is not None:
                     self.rendered_segments[segment_index] = result
                     return result
+            except TimeoutError:
+                # Future not ready yet, loop back to check pending_index
+                continue
             except Exception as e:
-                logger.warning("Khong lay duoc segment %d: %s", segment_index, _format_exception(e))
+                logger.warning(
+                    "Khong lay duoc segment %d: %s", segment_index, _format_exception(e)
+                )
 
             attempt += 1
+
             self.render_futures.pop(segment_index, None)
             delay = _segment_retry_delay(attempt)
-            self.emit_event({
-                "type": "segment_retry",
-                "sessionId": self.id,
-                "chapterId": chapter.chapterId,
-                "chapterIndex": chapter.chapterIndex,
-                "segmentIndex": segment_index,
-                "totalSegments": self.total_segments,
-                "attempt": attempt + 1,
-                "message": f"Render lỗi, thử lại sau {delay:.1f}s",
-            })
+            self.emit_event(
+                {
+                    "type": "segment_retry",
+                    "sessionId": self.id,
+                    "chapterId": chapter.chapterId,
+                    "chapterIndex": chapter.chapterIndex,
+                    "segmentIndex": segment_index,
+                    "totalSegments": self.total_segments,
+                    "attempt": attempt + 1,
+                    "message": f"Render lỗi, thử lại sau {delay:.1f}s",
+                }
+            )
             if attempt == 1 or attempt % 5 == 0:
                 logger.warning(
                     "Segment %d se retry lan %d sau %.1fs",
@@ -1009,7 +1393,14 @@ class RuntimeSession:
                     attempt,
                     delay,
                 )
-            time.sleep(delay)
+            waited = 0.0
+            while waited < delay and not self.stop_requested.is_set():
+                with self.lock:
+                    if self.pending_index is not None:
+                        return None
+                step = min(0.1, delay - waited)
+                time.sleep(step)
+                waited += step
 
         return None
 
@@ -1025,11 +1416,24 @@ class SessionRegistry:
 
         try:
             current_index = next(
-                index for index, item in enumerate(request.chapters)
+                index
+                for index, item in enumerate(request.chapters)
                 if item.chapterId == request.chapterId
             )
         except StopIteration as exc:
-            raise HTTPException(status_code=400, detail="Không tìm thấy chapterId trong danh sách chương") from exc
+            raise HTTPException(
+                status_code=400,
+                detail="Không tìm thấy chapterId trong danh sách chương",
+            ) from exc
+
+        logger.info(
+            "Creating session: storyId=%d, chapterId=%d, current_index=%d, startSegmentIndex=%d, chapters_count=%d",
+            request.storyId,
+            request.chapterId,
+            current_index,
+            request.startSegmentIndex,
+            len(request.chapters),
+        )
 
         session = RuntimeSession(
             id=uuid.uuid4().hex,
@@ -1050,13 +1454,19 @@ class SessionRegistry:
         with self._lock:
             session = self._items.get(session_id)
         if session is None:
-            raise HTTPException(status_code=404, detail="Không tìm thấy session realtime")
+            raise HTTPException(
+                status_code=404, detail="Không tìm thấy session realtime"
+            )
         return session
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             total = len(self._items)
-            active = sum(1 for item in self._items.values() if item.status in {"pending", "streaming"})
+            active = sum(
+                1
+                for item in self._items.values()
+                if item.status in {"pending", "streaming"}
+            )
             items = [item.to_response() for item in self._items.values()]
         return {"total": total, "active": active, "items": items}
 
@@ -1064,7 +1474,16 @@ class SessionRegistry:
         with self._lock:
             session = self._items.pop(session_id, None)
         if session:
-            session.stop()
+            session.close()
+
+    def cleanup_all(self) -> None:
+        """Stop and clean up all sessions (for app shutdown)."""
+        with self._lock:
+            sessions = list(self._items.values())
+            self._items.clear()
+        for session in sessions:
+            session.close()
+        logger.info("Cleaned up %d active sessions", len(sessions))
 
 
 # ─── App State ────────────────────────────────────────────────────────────────
@@ -1075,8 +1494,20 @@ registry = SessionRegistry()
 DEFAULT_VOICE = "vi-VN-NamMinhNeural"
 
 VIETNAMESE_VOICES = [
-    RealtimeVoice(id="vi-VN-HoaiMyNeural", name="vi-VN-HoaiMyNeural", locale="vi-VN", gender="Female", friendlyName="Microsoft HoaiMy Online (Natural) - Vietnamese"),
-    RealtimeVoice(id="vi-VN-NamMinhNeural", name="vi-VN-NamMinhNeural", locale="vi-VN", gender="Male", friendlyName="Microsoft NamMinh Online (Natural) - Vietnamese"),
+    RealtimeVoice(
+        id="vi-VN-HoaiMyNeural",
+        name="vi-VN-HoaiMyNeural",
+        locale="vi-VN",
+        gender="Female",
+        friendlyName="Microsoft HoaiMy Online (Natural) - Vietnamese",
+    ),
+    RealtimeVoice(
+        id="vi-VN-NamMinhNeural",
+        name="vi-VN-NamMinhNeural",
+        locale="vi-VN",
+        gender="Male",
+        friendlyName="Microsoft NamMinh Online (Natural) - Vietnamese",
+    ),
 ]
 
 
@@ -1126,12 +1557,13 @@ async def stream_session(session_id: str, websocket: WebSocket):
         logger.exception("WebSocket error for session %s: %s", session_id, e)
     finally:
         session.stop()
+        registry.remove(session_id)
+        logger.info("Session %s removed from registry", session_id)
 
 
 @app.post("/sessions/{session_id}/stop")
 def stop_session(session_id: str) -> dict[str, str]:
-    session = registry.get(session_id)
-    session.stop()
+    registry.remove(session_id)
     return {"status": "stopped", "id": session_id}
 
 
@@ -1150,7 +1582,9 @@ def skip_prev(session_id: str) -> dict[str, str]:
 
 
 @app.post("/sessions/{session_id}/controls")
-def update_controls(session_id: str, controls: UpdateSessionControlsRequest) -> SessionResponse:
+def update_controls(
+    session_id: str, controls: UpdateSessionControlsRequest
+) -> SessionResponse:
     session = registry.get(session_id)
     return session.update_controls(controls)
 
@@ -1166,4 +1600,5 @@ def seek_session(session_id: str, request: SeekSessionRequest) -> SessionRespons
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="127.0.0.1", port=8010, log_level="info")

@@ -44,3 +44,18 @@ coverage.out
 
 # File cục bộ không thuộc source
 .tmp_fix.js
+
+# Data runtime - test artifacts (không commit)
+data/run/*.mp3
+data/run/*.txt
+data/run/*.exe
+data/run/tts-venv/
+data/run/test_*/
+data/run/sample*/
+data/run/probe*/
+data/run/edge-*/
+data/run/seg*/
+data/run/unicode*/
+data/run/variant*/
+data/run/retry*/
+data/run/safe*/

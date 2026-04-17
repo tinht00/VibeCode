@@ -219,45 +219,6 @@ type ChapterContent struct {
 	UpdatedAt      time.Time `json:"updatedAt"`
 }
 
-type DirectTTSRequest struct {
-	Preset ProsodyPreset `json:"preset"`
-	Voice  string        `json:"voice,omitempty"`
-}
-
-type DirectTTSResponse struct {
-	AudioURL   string        `json:"audioUrl"`
-	CacheHit   bool          `json:"cacheHit"`
-	Preset     ProsodyPreset `json:"preset"`
-	Voice      string        `json:"voice"`
-	DurationMS int64         `json:"durationMs"`
-}
-
-type DirectTTSChunk struct {
-	Index     int    `json:"index"`
-	WordCount int    `json:"wordCount"`
-	Status    string `json:"status"`
-	AudioURL  string `json:"audioUrl,omitempty"`
-	CacheHit  bool   `json:"cacheHit"`
-	Error     string `json:"error,omitempty"`
-}
-
-type DirectTTSSession struct {
-	ID           string           `json:"id"`
-	StoryID      int64            `json:"storyId"`
-	ChapterID    int64            `json:"chapterId"`
-	ChapterTitle string           `json:"chapterTitle"`
-	Status       string           `json:"status"`
-	Preset       ProsodyPreset    `json:"preset"`
-	Voice        string           `json:"voice"`
-	TotalChunks  int              `json:"totalChunks"`
-	ReadyChunks  int              `json:"readyChunks"`
-	CurrentChunk int              `json:"currentChunk"`
-	LastError    string           `json:"lastError,omitempty"`
-	Chunks       []DirectTTSChunk `json:"chunks"`
-	StartedAt    time.Time        `json:"startedAt"`
-	UpdatedAt    time.Time        `json:"updatedAt"`
-}
-
 type ReaderProgress struct {
 	StoryID          int64      `json:"storyId"`
 	ChapterIndex     int        `json:"chapterIndex"`
