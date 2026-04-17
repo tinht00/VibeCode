@@ -206,6 +206,7 @@ const shouldAutoScroll = ref(false); // Chỉ scroll khi user đã scroll thủ 
 let userHasScrolled = false;
 const audioCurrentTime = ref(0);
 const audioDuration = ref(0);
+const audioIsPlaying = ref(false);
 const readerFontSize = ref(18);
 const readerPaneTab = ref<"text" | "console">("text");
 const pendingSeekTarget = ref<{
@@ -2306,6 +2307,20 @@ function handleTimeUpdate() {
     scheduleProgressSave();
 }
 
+function handleAudioPlay() {
+    userPausedAudio = false;
+    audioIsPlaying.value = true;
+}
+
+function handleAudioPause() {
+    audioIsPlaying.value = false;
+    scheduleProgressSave();
+}
+
+function handleAudioEnded() {
+    audioIsPlaying.value = false;
+}
+
 function resetAudioTimelineState() {
     audioCurrentTime.value = 0;
     audioDuration.value = 0;
@@ -3951,7 +3966,7 @@ onUnmounted(() => {
                                         @click="togglePlayback"
                                         :class="{
                                             'is-playing':
-                                                realtimeStatus === 'reading' ||
+                                                audioIsPlaying ||
                                                 edgeReadAloudActive,
                                         }"
                                     >
@@ -3959,8 +3974,7 @@ onUnmounted(() => {
                                             class="center-glyph"
                                             :class="{
                                                 'is-playing':
-                                                    realtimeStatus ===
-                                                        'reading' ||
+                                                    audioIsPlaying ||
                                                     edgeReadAloudActive,
                                             }"
                                         ></span>
@@ -4134,7 +4148,7 @@ onUnmounted(() => {
                                         @click="togglePlayback"
                                         :class="{
                                             'is-playing':
-                                                realtimeStatus === 'reading' ||
+                                                audioIsPlaying ||
                                                 edgeReadAloudActive,
                                         }"
                                     >
@@ -4142,8 +4156,7 @@ onUnmounted(() => {
                                             class="center-glyph"
                                             :class="{
                                                 'is-playing':
-                                                    realtimeStatus ===
-                                                        'reading' ||
+                                                    audioIsPlaying ||
                                                     edgeReadAloudActive,
                                             }"
                                         ></span>
@@ -4758,8 +4771,9 @@ onUnmounted(() => {
                         ref="audioRef"
                         class="audio-player-hidden"
                         @timeupdate="handleTimeUpdate"
-                        @pause="scheduleProgressSave"
-                        @play="userPausedAudio = false"
+                        @pause="handleAudioPause"
+                        @play="handleAudioPlay"
+                        @ended="handleAudioEnded"
                     />
                 </article>
 
