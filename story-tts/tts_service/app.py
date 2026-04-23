@@ -749,25 +749,34 @@ class RuntimeSession:
             except Exception:
                 logger.exception("Không dừng được realtime stream")
 
-    def emit_event(self, payload: dict[str, Any]) -> None:
+    def emit_event(self, payload: dict[str, Any], epoch: int | None = None) -> None:
         self.updated_at = now_iso()
         # Don't emit if session is closed or loop/outbox not ready
         if self.closed.is_set():
             return
         if not self.loop or not self.outbox:
             return
+        if epoch is None:
+            with self.lock:
+                epoch = self.stream_epoch
         try:
             asyncio.run_coroutine_threadsafe(
-                self.outbox.put({"kind": "event", "payload": payload}), self.loop
+                self.outbox.put(
+                    {"kind": "event", "payload": payload, "epoch": epoch}
+                ),
+                self.loop,
             )
         except Exception as e:
             logger.debug("Failed to emit event %s: %s", payload.get("type"), e)
 
-    def emit_audio(self, payload: bytes) -> None:
+    def emit_audio(self, payload: bytes, epoch: int | None = None) -> None:
         if not payload or not self.loop or not self.outbox:
             return
+        if epoch is None:
+            with self.lock:
+                epoch = self.stream_epoch
         asyncio.run_coroutine_threadsafe(
-            self.outbox.put({"kind": "audio", "payload": payload}),
+            self.outbox.put({"kind": "audio", "payload": payload, "epoch": epoch}),
             self.loop,
         )
 
@@ -955,6 +964,15 @@ class RuntimeSession:
                 or self.pending_segment_index is None
             ):
                 return False
+            if self.pending_index is None or not (
+                0 <= self.pending_index < len(self.chapters)
+            ):
+                return False
+            # Chỉ coi là "same chapter seek" khi worker hiện tại thực sự đang xử lý
+            # đúng chapter đích. Nếu chapter context cũ vẫn còn chạy, hãy để
+            # _stream_chapter trả về "skipped" để outer loop chuyển chapter sạch sẽ.
+            if self.chapters[self.pending_index].chapterId != chapter.chapterId:
+                return False
             target_segment_index = max(
                 0, min(self.pending_segment_index, self.total_segments - 1)
             )
@@ -1126,6 +1144,9 @@ class RuntimeSession:
         3. Sau khi đọc đoạn N → đảm bảo đã render xong đoạn N+1
         4. Continue cho đến hết, đảm bảo không sót đoạn nào
         """
+        with self.lock:
+            chapter_epoch = self.stream_epoch
+
         # Chia chapter thành các đoạn theo word count
         segments = split_chapter_into_segments(chapter.text)
         if not segments:
@@ -1205,7 +1226,8 @@ class RuntimeSession:
                     for index, segment in enumerate(segments)
                 ],
                 "startSegmentIndex": self.current_segment_index,
-            }
+            },
+            epoch=chapter_epoch,
         )
 
         interrupted = False
@@ -1268,7 +1290,8 @@ class RuntimeSession:
                     "segmentText": rendered.text[:200],
                     "wordCount": len(rendered.text.split()),
                     "durationEstimate": rendered.duration_estimate,
-                }
+                },
+                epoch=segment_epoch,
             )
 
             # Gửi audio data
@@ -1286,7 +1309,7 @@ class RuntimeSession:
                         interrupted_by_seek = True
                         break
                 chunk = rendered.audio_data[offset : offset + chunk_size]
-                self.emit_audio(chunk)
+                self.emit_audio(chunk, epoch=segment_epoch)
                 # Sleep nhỏ để tránh gửi quá nhanh
                 time.sleep(0.001)
 
@@ -1305,7 +1328,8 @@ class RuntimeSession:
                     "chapterId": chapter.chapterId,
                     "chapterIndex": chapter.chapterIndex,
                     "segmentIndex": seg_idx,
-                }
+                },
+                epoch=segment_epoch,
             )
 
             self.render_futures.pop(seg_idx, None)
@@ -1547,6 +1571,8 @@ async def stream_session(session_id: str, websocket: WebSocket):
     try:
         while True:
             message = await outbox.get()
+            if message.get("epoch") != session.stream_epoch:
+                continue
             if message["kind"] == "event":
                 await websocket.send_json(message["payload"])
             elif message["kind"] == "audio":

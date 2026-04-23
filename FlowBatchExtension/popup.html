@@ -6,17 +6,17 @@
   <title>Flow Batch Generator</title>
   <style>
     :root {
-      --bg: #f6f1e8;
+      --bg: #f4efe5;
       --panel: rgba(255, 252, 246, 0.96);
-      --panel-strong: #fffaf1;
-      --line: rgba(41, 34, 24, 0.12);
-      --text: #221b14;
-      --muted: #6e6254;
-      --accent: #c44f2b;
-      --accent-strong: #8e2f14;
-      --success: #26734d;
+      --panel-strong: #fff8ec;
+      --line: rgba(45, 34, 22, 0.12);
+      --text: #211a13;
+      --muted: #74685b;
+      --accent: #b94624;
+      --accent-strong: #7f2c16;
+      --success: #256f4c;
       --danger: #a83232;
-      --shadow: 0 18px 40px rgba(68, 43, 18, 0.12);
+      --shadow: 0 16px 34px rgba(69, 47, 24, 0.12);
       --radius: 18px;
     }
 
@@ -38,7 +38,7 @@
     }
 
     main {
-      padding: 18px;
+      padding: 14px;
       min-height: 100vh;
     }
 
@@ -46,15 +46,15 @@
     .panel {
       background: var(--panel);
       border: 1px solid var(--line);
-      border-radius: 22px;
-      padding: 16px;
+      border-radius: 20px;
+      padding: 14px;
       box-shadow: var(--shadow);
       margin-bottom: 12px;
     }
 
     .hero h1 {
-      margin: 0 0 8px;
-      font-size: 24px;
+      margin: 0 0 6px;
+      font-size: 20px;
       line-height: 1.15;
     }
 
@@ -82,12 +82,14 @@
     }
 
     input,
+    select,
     textarea,
     button {
       font: inherit;
     }
 
     input,
+    select,
     textarea {
       width: 100%;
       border: 1px solid rgba(41, 34, 24, 0.14);
@@ -99,6 +101,7 @@
     }
 
     input:focus,
+    select:focus,
     textarea:focus {
       outline: none;
       border-color: rgba(196, 79, 43, 0.62);
@@ -147,6 +150,27 @@
     .button-secondary {
       background: rgba(34, 27, 20, 0.08);
       color: var(--text);
+    }
+
+    .button-ghost {
+      background: transparent;
+      color: var(--muted);
+      border: 1px solid var(--line);
+    }
+
+    .section-kicker {
+      margin: 0 0 4px;
+      color: var(--accent-strong);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .section-title {
+      margin: 0 0 8px;
+      font-size: 17px;
+      line-height: 1.2;
     }
 
     .status-card {
@@ -234,7 +258,7 @@
     .gallery-grid {
       display: grid;
       gap: 8px;
-      max-height: 280px;
+      max-height: 238px;
       overflow-y: auto;
     }
 
@@ -344,7 +368,7 @@
       -webkit-line-clamp: 3;
       -webkit-box-orient: vertical;
       overflow: hidden;
-      min-height: 48px;
+      min-height: 42px;
     }
 
     .gallery-meta {
@@ -358,12 +382,14 @@
     <section class="hero">
       <h1>Flow Batch Generator</h1>
       <p>
-        Chỉ giữ luồng tối giản: nhập và rà soát prompt, quét ảnh đang có trên Flow,
-        chọn ảnh cần giữ, rồi bấm tải trực tiếp từ menu trên từng card ảnh.
+        Prompt queue, gallery scan và download ảnh trong một panel gọn. Tải ảnh bằng menu Flow
+        để giữ đúng định dạng và chất lượng xuất ra.
       </p>
     </section>
 
     <section class="panel">
+      <p class="section-kicker">Prompt Queue</p>
+      <h2 class="section-title">Chuẩn bị và chạy prompt</h2>
       <div class="field">
         <label for="promptsInput">Danh sách prompt</label>
         <textarea
@@ -371,7 +397,7 @@
           placeholder='Dán JSON array chuỗi hoặc object có "full_prompt", hoặc nhập plain text và ngăn mỗi prompt bằng một dòng trống.'
         ></textarea>
         <p class="hint">
-          Phần này dùng để rà soát và lọc prompt. Extension không còn tự generate hay crop ảnh nữa.
+          Dùng để rà soát, chọn điểm bắt đầu và chạy batch. Crop ảnh tự động đã được loại bỏ.
         </p>
       </div>
 
@@ -391,16 +417,18 @@
         </div>
         <div id="promptPreviewContainer" class="prompt-preview-list"></div>
         <div class="actions">
-          <button id="fillSelectedPromptButton" class="button-primary">Điền prompt đã chọn</button>
-          <button id="fillNextPromptButton" class="button-secondary">Điền prompt kế tiếp</button>
-          <button id="runAllPromptsButton" class="button-primary">Chạy tất cả prompt</button>
+          <button id="fillSelectedPromptButton" class="button-secondary">Điền prompt</button>
+          <button id="fillNextPromptButton" class="button-ghost">Điền kế tiếp</button>
+          <button id="runAllPromptsButton" class="button-primary">Chạy từ prompt đang chọn</button>
           <button id="stopPromptRunButton" class="button-secondary">Dừng chạy prompt</button>
-          <button id="resetAllButton" class="button-secondary">Reset tất cả</button>
+          <button id="resetAllButton" class="button-ghost">Reset</button>
         </div>
       </div>
     </section>
 
     <section class="panel">
+      <p class="section-kicker">Download</p>
+      <h2 class="section-title">Quét và tải ảnh</h2>
       <div class="status-card">
         <div class="metric">
           <span class="label">Ảnh đang có</span>
@@ -413,6 +441,40 @@
       </div>
 
       <div class="field">
+        <label for="downloadMethodSelect">Cách tải ảnh</label>
+        <select id="downloadMethodSelect">
+          <option value="direct-url">URL trực tiếp</option>
+          <option value="flow-menu">Menu Flow 1K/2K</option>
+        </select>
+        <p class="hint">
+          URL trực tiếp tải nhanh như bản đầu, nhưng extension sẽ đặt đuôi file rõ ràng.
+        </p>
+      </div>
+
+      <div class="field">
+        <label for="directFormatSelect">Định dạng khi tải URL trực tiếp</label>
+        <select id="directFormatSelect">
+          <option value="jpg">JPG</option>
+          <option value="png">PNG</option>
+          <option value="webp">WebP</option>
+        </select>
+        <p class="hint">
+          JPG chỉ đổi `.jfif` thành `.jpg`; PNG/WebP sẽ convert ảnh trước khi tải.
+        </p>
+      </div>
+
+      <div class="field">
+        <label for="downloadQualitySelect">Chất lượng tải từ Flow</label>
+        <select id="downloadQualitySelect">
+          <option value="2k">2K Upscaled</option>
+          <option value="1k">1K Original</option>
+        </select>
+        <p class="hint">
+          Chỉ dùng khi chọn cách tải bằng menu Flow.
+        </p>
+      </div>
+
+      <div class="field">
         <label>Trạng thái chi tiết</label>
         <div id="messageBox" class="message-box">
           Mở đúng tab Flow, bấm “Nhận diện ảnh hiện có”, sau đó chọn ảnh cần tải.
@@ -420,13 +482,17 @@
       </div>
 
       <div class="actions">
-        <button id="scanSessionButton" class="button-primary">Nhận diện ảnh hiện có</button>
-        <button id="downloadFromFlowButton" class="button-secondary">Tải ảnh đã chọn từ Flow</button>
-        <button id="clearGalleryButton" class="button-secondary">Xóa gallery</button>
+        <button id="scanSessionButton" class="button-primary">Quét ảnh Flow</button>
+        <button id="downloadFromFlowButton" class="button-secondary">Tải ảnh đã chọn</button>
+        <button id="selectAllGalleryButton" class="button-ghost">Chọn tất cả</button>
+        <button id="clearSelectionButton" class="button-ghost">Bỏ chọn</button>
+        <button id="openDownloadsButton" class="button-ghost">Mở thư mục tải</button>
+        <button id="clearGalleryButton" class="button-ghost">Xóa gallery</button>
       </div>
     </section>
 
     <section class="panel">
+      <p class="section-kicker">Gallery</p>
       <div class="gallery-header">
         <h2>Gallery Kết Quả</h2>
         <span id="galleryCount" class="gallery-count">0 ảnh</span>
@@ -435,6 +501,7 @@
     </section>
   </main>
 
+  <script src="downloadStrategy.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

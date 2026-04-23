@@ -164,8 +164,10 @@ const realtimeSpeed = ref(0);
 const realtimePitch = ref(0);
 const realtimeStatus = ref<RealtimeStatus>("idle");
 const realtimeSession = ref<RealtimeSession | null>(null);
-const realtimeCurrentChapterId = ref<number | null>(null);
-const realtimeCurrentChapterTitle = ref("");
+const realtimeBufferedChapterId = ref<number | null>(null);
+const realtimeBufferedChapterTitle = ref("");
+const realtimeAudibleChapterId = ref<number | null>(null);
+const realtimeAudibleChapterTitle = ref("");
 const realtimeError = ref("");
 const realtimeServiceError = ref("");
 const realtimeConnecting = ref(false);
@@ -189,6 +191,7 @@ const contentCache = new Map<number, ChapterContent>();
 let progressTimer: number | null = null;
 let realtimeControlsSyncTimer: number | null = null;
 let realtimeRestartTimer: number | null = null;
+let pendingSeekFallbackTimer: number | null = null;
 let activeSocket: ReconnectWebSocket | null = null;
 let activeMediaSource: MediaSource | null = null;
 let activeSourceBuffer: SourceBuffer | null = null;
@@ -214,6 +217,7 @@ const pendingSeekTarget = ref<{
     segmentIndex: number;
 } | null>(null);
 const autoSyncingPlaybackChapterId = ref<number | null>(null);
+const playbackAutoSyncLockChapterId = ref<number | null>(null);
 
 const selectedChapter = computed<Chapter | null>(() => {
     if (!selectedStory.value || selectedChapterId.value === null) return null;
@@ -304,11 +308,27 @@ const selectedRealtimeChapterGroup = computed(() => {
     );
 });
 
-const playingChapterGroup = computed(() => {
-    const chapterId =
+const currentPlaybackChapterId = computed<number | null>(() => {
+    return (
         actualPlaybackLocation.value?.chapterId ??
-        realtimeCurrentChapterId.value ??
-        selectedChapterId.value;
+        realtimeAudibleChapterId.value ??
+        realtimePlaybackCursor.value?.chapterId ??
+        null
+    );
+});
+
+const currentPlaybackChapterGroup = computed(() => {
+    const chapterId = currentPlaybackChapterId.value;
+    if (chapterId === null) return null;
+    return (
+        sortedRealtimeChapterGroups.value.find(
+            (group) => group.chapterId === chapterId,
+        ) ?? null
+    );
+});
+
+const playingChapterGroup = computed(() => {
+    const chapterId = currentPlaybackChapterId.value ?? selectedChapterId.value;
     if (chapterId === null) return null;
     return (
         sortedRealtimeChapterGroups.value.find(
@@ -318,12 +338,12 @@ const playingChapterGroup = computed(() => {
 });
 
 const currentPlayingChapterTitle = computed(() => {
-    const group = playingChapterGroup.value;
+    const group = currentPlaybackChapterGroup.value ?? playingChapterGroup.value;
     if (group?.chapterTitle) {
         return group.chapterTitle;
     }
-    if (realtimeCurrentChapterTitle.value) {
-        return realtimeCurrentChapterTitle.value;
+    if (realtimeAudibleChapterTitle.value) {
+        return realtimeAudibleChapterTitle.value;
     }
     if (selectedChapter.value?.title) {
         return selectedChapter.value.title;
@@ -526,17 +546,92 @@ const visiblePlayingSegmentRange = computed(() => {
     return getVisibleSegmentRangeForGroup(playingChapterGroup.value);
 });
 
+function getRealtimeChapterSortWeight(group: RealtimeChapterSegmentGroup) {
+    if (currentPlaybackChapterId.value === group.chapterId) {
+        return 0;
+    }
+    if (
+        selectedChapterId.value === group.chapterId &&
+        selectedChapterId.value !== currentPlaybackChapterId.value
+    ) {
+        return 1;
+    }
+    if (
+        realtimeBufferedChapterId.value === group.chapterId &&
+        realtimeBufferedChapterId.value !== currentPlaybackChapterId.value
+    ) {
+        return 2;
+    }
+    if (
+        currentPlaybackChapterGroup.value &&
+        group.chapterIndex > currentPlaybackChapterGroup.value.chapterIndex
+    ) {
+        return 3;
+    }
+    return 4;
+}
+
+function shouldShowRealtimeChapterGroup(entry: {
+    group: RealtimeChapterSegmentGroup;
+    window: ReturnType<typeof getVisibleSegmentWindowForGroup>;
+}) {
+    if (entry.window.items.length === 0) return false;
+
+    const playbackGroup = currentPlaybackChapterGroup.value;
+    if (!playbackGroup) return true;
+
+    if (entry.group.chapterId === playbackGroup.chapterId) return true;
+    if (entry.group.chapterId === selectedChapterId.value) return true;
+    if (entry.group.chapterId === realtimeBufferedChapterId.value) return true;
+
+    // Ẩn chapter đã nằm phía sau chapter audio hiện tại để panel chính không
+    // bị lẫn giữa phần đã đọc xong và phần đang phát/sắp phát.
+    if (entry.group.chapterIndex < playbackGroup.chapterIndex) {
+        return false;
+    }
+
+    return true;
+}
+
 const renderChapterGroups = computed(() =>
     sortedRealtimeChapterGroups.value
         .map((group) => ({
             group,
             window: getVisibleSegmentWindowForGroup(group),
             note: getVisibleSegmentRangeForGroup(group),
-            isPlaybackChapter:
-                actualPlaybackLocation.value?.chapterId === group.chapterId,
+            displayState: getRealtimeChapterDisplayState(group),
+            isPlaybackChapter: currentPlaybackChapterId.value === group.chapterId,
         }))
-        .filter((entry) => entry.window.items.length > 0),
+        .filter((entry) => shouldShowRealtimeChapterGroup(entry))
+        .sort((left, right) => {
+            const weightDiff =
+                getRealtimeChapterSortWeight(left.group) -
+                getRealtimeChapterSortWeight(right.group);
+            if (weightDiff !== 0) return weightDiff;
+            return left.group.chapterIndex - right.group.chapterIndex;
+        }),
 );
+
+const bufferedAheadSummary = computed(() => {
+    if (
+        realtimeBufferedChapterId.value === null ||
+        realtimeBufferedChapterId.value === currentPlaybackChapterId.value
+    ) {
+        return "";
+    }
+
+    const bufferedGroup =
+        sortedRealtimeChapterGroups.value.find(
+            (group) => group.chapterId === realtimeBufferedChapterId.value,
+        ) ?? null;
+    const bufferedTitle =
+        bufferedGroup?.chapterTitle ?? realtimeBufferedChapterTitle.value;
+    if (!bufferedTitle) {
+        return "";
+    }
+
+    return `Backend dang nap ahead toi ${bufferedTitle}; audio van bam theo chapter dang phat thuc te.`;
+});
 
 const showReaderConsole = computed(
     () => !useEdgeReadAloud.value && readerPaneTab.value === "console",
@@ -545,6 +640,31 @@ const showReaderConsole = computed(
 const showReaderText = computed(
     () => useEdgeReadAloud.value || readerPaneTab.value === "text",
 );
+
+const textHighlightLeadSeconds = 0.2;
+
+const readerTargetsDifferentRealtimeChapter = computed(() => {
+    if (useEdgeReadAloud.value) return false;
+    if (!selectedChapterId.value || !currentPlaybackChapterId.value) return false;
+    return selectedChapterId.value !== currentPlaybackChapterId.value;
+});
+
+const readerPlayButtonIsPlaying = computed(() => {
+    if (useEdgeReadAloud.value) {
+        return edgeReadAloudActive.value;
+    }
+    return !readerTargetsDifferentRealtimeChapter.value && audioIsPlaying.value;
+});
+
+const readerPlayButtonLabel = computed(() => {
+    if (useEdgeReadAloud.value) {
+        return edgeReadAloudActive.value ? "Tạm dừng Edge" : "Phát Edge";
+    }
+    if (readerTargetsDifferentRealtimeChapter.value) {
+        return "Phát chương này";
+    }
+    return audioIsPlaying.value ? "Tạm dừng" : "Phát";
+});
 
 // Calculate dynamic segment status based on actual playback position
 // Returns: "reading" | "played" | "queued"
@@ -566,6 +686,14 @@ function getDynamicSegmentStatus(
             return "reading";
         }
     }
+    if (
+        currentPlaybackChapterGroup.value &&
+        group &&
+        group.chapterId !== currentPlaybackChapterGroup.value.chapterId &&
+        group.chapterIndex < currentPlaybackChapterGroup.value.chapterIndex
+    ) {
+        return "played";
+    }
     if (segment?.status === "rendering" || segment?.status === "retrying") {
         return segment.status;
     }
@@ -573,6 +701,61 @@ function getDynamicSegmentStatus(
         return "ready";
     }
     return "queued";
+}
+
+function chapterGroupHasBufferedAudio(group: RealtimeChapterSegmentGroup) {
+    return group.segments.some(
+        (segment) =>
+            segment.durationEstimate > 0 ||
+            ["ready", "played", "reading", "rendering", "retrying"].includes(
+                segment.status,
+            ),
+    );
+}
+
+function getRealtimeChapterDisplayState(group: RealtimeChapterSegmentGroup) {
+    if (actualPlaybackLocation.value?.chapterId === group.chapterId) {
+        return {
+            tone: "reading",
+            label: "Dang phat",
+        } as const;
+    }
+
+    const hasRenderingWork = group.segments.some((segment) =>
+        ["rendering", "retrying"].includes(segment.status),
+    );
+    if (hasRenderingWork || realtimeBufferedChapterId.value === group.chapterId) {
+        return {
+            tone: "rendering",
+            label:
+                realtimeBufferedChapterId.value === group.chapterId
+                    ? "Dang nap truoc"
+                    : "Dang tao tiep",
+        } as const;
+    }
+
+    const hasBufferedAudio = chapterGroupHasBufferedAudio(group);
+    if (!hasBufferedAudio) {
+        return {
+            tone: "queued",
+            label: "Da tach",
+        } as const;
+    }
+
+    if (
+        currentPlaybackChapterGroup.value &&
+        group.chapterIndex < currentPlaybackChapterGroup.value.chapterIndex
+    ) {
+        return {
+            tone: "played",
+            label: "Da phat qua",
+        } as const;
+    }
+
+    return {
+        tone: "ready",
+        label: "Da nap truoc",
+    } as const;
 }
 
 function isSegmentNowPlaying(
@@ -648,7 +831,18 @@ const activeWordGlobalIndex = computed<number | null>(() => {
         startWord += segment.wordCount;
     }
 
-    const progress = Math.min(0.999, Math.max(0, playback.progress));
+    const segmentDuration = Math.max(
+        0.8,
+        getApproxSegmentDuration(targetSegment),
+    );
+    // Đẩy highlight đi sớm hơn một nhịp nhỏ để mắt bám sát tiếng đọc hơn.
+    const progress = Math.min(
+        0.999,
+        Math.max(
+            0,
+            playback.progress + textHighlightLeadSeconds / segmentDuration,
+        ),
+    );
     const offset = Math.min(
         targetSegment.wordCount - 1,
         Math.floor(progress * targetSegment.wordCount),
@@ -693,6 +887,9 @@ function isWordInActiveSegment(wordIndex: number | null): boolean {
 }
 
 const realtimeStatusLabel = computed(() => {
+    if (pendingSeekTarget.value) {
+        return "Đang nhảy đoạn";
+    }
     switch (realtimeStatus.value) {
         case "connecting":
             return "Đang kết nối";
@@ -716,6 +913,9 @@ const realtimeStatusLabel = computed(() => {
 const realtimeStatusText = computed(() => {
     if (realtimeError.value) return realtimeError.value;
     if (realtimeServiceError.value) return realtimeServiceError.value;
+    if (pendingSeekTarget.value) {
+        return `Đang chuyển tới segment ${pendingSeekTarget.value.segmentIndex + 1} đã chọn và tận dụng cache audio hiện có nếu đã render.`;
+    }
 
     // === FIX: Use displayed chapter title instead of TTS cursor chapter ===
     const displayChapterTitle =
@@ -826,6 +1026,7 @@ function resetRealtimeSegments() {
     realtimePlaybackCursor.value = null;
     realtimePlaybackTimeline.value = [];
     pendingSeekTarget.value = null;
+    playbackAutoSyncLockChapterId.value = null;
     dropIncomingAudioUntilSeekStart = false;
 }
 
@@ -2076,13 +2277,21 @@ function currentScrollPercent() {
 
 async function persistProgress(audioPositionSec = 0) {
     const story = selectedStory.value?.story;
-    const chapter = selectedChapter.value;
+    const targetChapterId =
+        isRealtimeActive.value && currentPlaybackChapterId.value !== null
+            ? currentPlaybackChapterId.value
+            : selectedChapterId.value;
+    const chapter =
+        selectedStory.value?.chapters.find(
+            (item) => item.id === targetChapterId,
+        ) ?? selectedChapter.value;
     if (!story || !chapter) return;
 
     const payload: ReaderProgress = {
         storyId: story.id,
         chapterIndex: chapter.chapterIndex,
-        scrollPercent: currentScrollPercent(),
+        scrollPercent:
+            selectedChapterId.value === chapter.id ? currentScrollPercent() : 0,
         audioPositionSec,
     };
 
@@ -2356,6 +2565,30 @@ function togglePlayback() {
     }
 }
 
+async function handleReaderPlayAction() {
+    if (useEdgeReadAloud.value) {
+        togglePlayback();
+        return;
+    }
+
+    const targetChapterId = selectedChapterId.value;
+    if (
+        readerTargetsDifferentRealtimeChapter.value &&
+        targetChapterId !== null
+    ) {
+        const targetGroup =
+            sortedRealtimeChapterGroups.value.find(
+                (group) => group.chapterId === targetChapterId,
+            ) ?? null;
+        const startSegmentIndex = targetGroup?.startSegmentIndex ?? 0;
+        toast.info("Chuyển sang đọc chương đang mở.");
+        await jumpToRealtimeSegment(targetChapterId, startSegmentIndex);
+        return;
+    }
+
+    togglePlayback();
+}
+
 function seekAudio(event: MouseEvent) {
     const container = event.currentTarget as HTMLElement;
     if (!container || !audioRef.value) return;
@@ -2438,6 +2671,7 @@ async function jumpToRealtimeSegment(chapterId: number, segmentIndex: number) {
     if (!selectedStory.value) return;
     const baseUrl = realtimeBaseUrl();
     if (!baseUrl) return;
+    playbackAutoSyncLockChapterId.value = chapterId;
 
     if (selectedChapterId.value !== chapterId) {
         await loadChapter(chapterId, null, {
@@ -2461,16 +2695,17 @@ async function jumpToRealtimeSegment(chapterId: number, segmentIndex: number) {
     const targetSegmentDynamicStatus = targetSegment
         ? getDynamicSegmentStatus(targetSegment.index, chapterId)
         : null;
-    const canSeekCurrentSession =
+    const hasCurrentRealtimeSession =
         Boolean(currentSessionId) &&
         Boolean(targetChapterGroup) &&
-        targetSegment !== null &&
+        targetSegment !== null;
+    const canFastResumeCurrentSession =
         targetSegmentDynamicStatus !== null &&
         ["ready", "played", "reading"].includes(targetSegmentDynamicStatus);
 
-    if (canSeekCurrentSession && currentSessionId) {
+    if (hasCurrentRealtimeSession && currentSessionId) {
         console.log(
-            `[Seek] Reusing rendered audio for chapter ${chapterId}, segment ${segmentIndex}`,
+            `[Seek] Reusing current session for chapter ${chapterId}, segment ${segmentIndex} (status=${targetSegmentDynamicStatus ?? "unknown"})`,
         );
         try {
             pendingSeekTarget.value = { chapterId, segmentIndex };
@@ -2481,21 +2716,39 @@ async function jumpToRealtimeSegment(chapterId: number, segmentIndex: number) {
                 audioRef.value.pause();
             }
             await prepareRealtimeMediaStream({
-                fastResume: true,
+                fastResume: canFastResumeCurrentSession,
             });
-            await api.seekRealtimeSession(baseUrl, currentSessionId, {
+            const updatedSession = await api.seekRealtimeSession(
+                baseUrl,
+                currentSessionId,
+                {
+                    chapterId,
+                    segmentIndex,
+                },
+            );
+            realtimeSession.value = updatedSession;
+            schedulePendingSeekFallback(
+                currentSessionId,
                 chapterId,
                 segmentIndex,
-            });
-            toast.info(
-                `Đọc ngay đoạn ${segmentIndex + 1} từ audio đã render.`,
             );
+            if (canFastResumeCurrentSession) {
+                toast.info(
+                    `Đọc ngay đoạn ${segmentIndex + 1} từ audio đã render.`,
+                );
+            } else {
+                toast.info(
+                    `Chuyển sang đoạn ${segmentIndex + 1} trong session hiện tại để tiếp tục render từ cache đang có.`,
+                );
+            }
             return;
         } catch (err) {
+            clearPendingSeekFallbackTimer();
             pendingSeekTarget.value = null;
             dropIncomingAudioUntilSeekStart = false;
+            playbackAutoSyncLockChapterId.value = null;
             console.warn(
-                "[Seek] Seek session thất bại, fallback sang restart:",
+                "[Seek] Seek current session thất bại, fallback sang restart:",
                 err,
             );
         }
@@ -2633,7 +2886,15 @@ async function startRealtimePlayback(
     error.value = "";
 
     try {
-        await stopRealtimePlayback({ quiet: true, clearSession: true });
+        // Chỉ await stop khi thật sự có phiên cũ để không làm mất user gesture.
+        if (
+            realtimeSession.value?.id ||
+            activeSocket ||
+            activeMediaSource ||
+            activeMediaUrl
+        ) {
+            await stopRealtimePlayback({ quiet: true, clearSession: true });
+        }
         resetRealtimeSegments();
         realtimeStatus.value = "connecting";
         await prepareRealtimeMediaStream();
@@ -2643,14 +2904,15 @@ async function startRealtimePlayback(
         );
         const session = await api.createRealtimeSession(baseUrl, payload);
         realtimeSession.value = session;
-        realtimeCurrentChapterId.value =
-            options.startChapterId ?? session.chapterId;
-        realtimeCurrentChapterTitle.value =
+        const initialChapterId = options.startChapterId ?? session.chapterId;
+        const initialChapterTitle =
             selectedStory.value.chapters.find(
-                (chapter) =>
-                    chapter.id ===
-                    (options.startChapterId ?? session.chapterId),
-            )?.title ?? selectedChapter.value.title;
+                (chapter) => chapter.id === initialChapterId,
+            )?.title ?? selectedChapter.value?.title ?? "";
+        realtimeBufferedChapterId.value = initialChapterId;
+        realtimeBufferedChapterTitle.value = initialChapterTitle;
+        realtimeAudibleChapterId.value = initialChapterId;
+        realtimeAudibleChapterTitle.value = initialChapterTitle;
         isPlaybackActive = true; // Đánh dấu bắt đầu phiên playback
         connectRealtimeSocket(baseUrl, session.id);
     } catch (err) {
@@ -2680,6 +2942,58 @@ function clearRealtimeRestartTimer() {
         window.clearTimeout(realtimeRestartTimer);
         realtimeRestartTimer = null;
     }
+}
+
+function clearPendingSeekFallbackTimer() {
+    if (pendingSeekFallbackTimer !== null) {
+        window.clearTimeout(pendingSeekFallbackTimer);
+        pendingSeekFallbackTimer = null;
+    }
+}
+
+function schedulePendingSeekFallback(
+    sessionId: string,
+    chapterId: number,
+    segmentIndex: number,
+) {
+    clearPendingSeekFallbackTimer();
+    pendingSeekFallbackTimer = window.setTimeout(() => {
+        const stillPending =
+            pendingSeekTarget.value?.chapterId === chapterId &&
+            pendingSeekTarget.value?.segmentIndex === segmentIndex;
+        const sameSession = realtimeSession.value?.id === sessionId;
+        if (!stillPending || !sameSession) {
+            return;
+        }
+
+        console.warn(
+            `[Seek] Timeout waiting for ${chapterId}:${segmentIndex}. Falling back to restart playback.`,
+        );
+        pendingSeekTarget.value = null;
+        dropIncomingAudioUntilSeekStart = false;
+        playbackAutoSyncLockChapterId.value = null;
+
+        void (async () => {
+            try {
+                await stopRealtimePlayback({ quiet: true, clearSession: true });
+                await new Promise((resolve) => window.setTimeout(resolve, 300));
+                toast.info(
+                    `Seek đang bị kẹt, mở lại đọc từ đoạn ${segmentIndex + 1}...`,
+                );
+                await startRealtimePlayback({
+                    startChapterId: chapterId,
+                    startSegmentIndex: segmentIndex,
+                });
+            } catch (err) {
+                const message =
+                    err instanceof Error ? err.message : String(err);
+                realtimeStatus.value = "error";
+                realtimeError.value = message;
+                error.value = message;
+                toast.error(`Không thể đọc từ đoạn đã chọn: ${message}`);
+            }
+        })();
+    }, 2500);
 }
 
 async function syncRealtimeControls() {
@@ -2729,6 +3043,7 @@ async function stopRealtimePlayback(
 ) {
     clearRealtimeControlSyncTimer();
     clearRealtimeRestartTimer();
+    clearPendingSeekFallbackTimer();
     const baseUrl = realtimeBaseUrl();
     const sessionId = realtimeSession.value?.id;
 
@@ -2747,8 +3062,10 @@ async function stopRealtimePlayback(
     resetRealtimeSegments();
     if (options.clearSession) {
         realtimeSession.value = null;
-        realtimeCurrentChapterId.value = null;
-        realtimeCurrentChapterTitle.value = "";
+        realtimeBufferedChapterId.value = null;
+        realtimeBufferedChapterTitle.value = "";
+        realtimeAudibleChapterId.value = null;
+        realtimeAudibleChapterTitle.value = "";
         realtimeStatus.value = "stopped";
     }
     await persistProgress(0).catch(() => undefined);
@@ -2781,6 +3098,13 @@ async function prepareRealtimeMediaStream(
     pendingMediaEnd = false;
     queuedAudioChunks = [];
     isPlaybackActive = true;
+
+    // Gắn MediaSource vào audio trước khi chờ sourceopen, nếu không sourceopen
+    // sẽ không bao giờ nổ đúng thời điểm và browser cũng không thể prime playback.
+    audioRef.value.src = activeMediaUrl;
+    audioRef.value.autoplay = false;
+    audioRef.value.load();
+    void resumeRealtimeAudioPlayback();
 
     console.log("[MediaStream] MediaSource created, waiting for sourceopen...");
 
@@ -2862,10 +3186,6 @@ async function prepareRealtimeMediaStream(
             { once: true },
         );
     }
-
-    audioRef.value.src = activeMediaUrl;
-    audioRef.value.autoplay = false;
-    audioRef.value.load();
 
     console.log(
         "[MediaStream] Audio player setup complete, waiting for backend audio chunks...",
@@ -3001,6 +3321,7 @@ function flushAudioChunkQueue() {
     // Nhưng KHÔNG reset audio element - giữ nguyên currentTime
     if (
         remainingBuffer < 2 &&
+        currentTime > 0.05 &&
         audioRef.value &&
         !audioRef.value.paused &&
         !userPausedAudio
@@ -3326,8 +3647,10 @@ function handleRealtimeEvent(event: RealtimeSessionState) {
                     break;
                 }
                 if (isPendingSeekStart) {
+                    clearPendingSeekFallbackTimer();
                     pendingSeekTarget.value = null;
                     dropIncomingAudioUntilSeekStart = false;
+                    playbackAutoSyncLockChapterId.value = null;
                 }
                 appendPlaybackTimelineEntry({
                     chapterId: event.chapterId,
@@ -3388,21 +3711,20 @@ function handleRealtimeEvent(event: RealtimeSessionState) {
             break;
         case "chapter_started":
             realtimeStatus.value = "reading";
-            realtimeCurrentChapterId.value = event.chapterId ?? null;
-            realtimeCurrentChapterTitle.value = event.chapterTitle ?? "";
+            realtimeBufferedChapterId.value = event.chapterId ?? null;
+            realtimeBufferedChapterTitle.value = event.chapterTitle ?? "";
             if (typeof event.chapterId === "number") {
-                void persistPlaybackChapterProgress(event.chapterId, 0).catch(
-                    () => undefined,
-                );
                 patchRealtimeChapterGroup(event.chapterId, {
                     chapterIndex: event.chapterIndex,
                     chapterTitle: event.chapterTitle,
-                    status: "reading",
+                    status: "rendering",
                 });
             }
             break;
         case "chapter_finished":
-            realtimeStatus.value = "transitioning";
+            realtimeStatus.value = pendingSeekTarget.value
+                ? "buffering"
+                : "transitioning";
             if (typeof event.chapterId === "number") {
                 patchRealtimeChapterGroup(event.chapterId, {
                     status: "completed",
@@ -3411,11 +3733,15 @@ function handleRealtimeEvent(event: RealtimeSessionState) {
             void persistProgress(0);
             break;
         case "chapter_transition":
-            realtimeStatus.value = "transitioning";
+            realtimeStatus.value =
+                pendingSeekTarget.value || event.reason === "seek"
+                    ? "buffering"
+                    : "transitioning";
             break;
         case "story_finished":
             realtimeStatus.value = "finished";
             realtimePlaybackCursor.value = null;
+            clearPendingSeekFallbackTimer();
             pendingSeekTarget.value = null;
             dropIncomingAudioUntilSeekStart = false;
             finishRealtimeStream();
@@ -3426,6 +3752,7 @@ function handleRealtimeEvent(event: RealtimeSessionState) {
         case "stopped":
             realtimeStatus.value = "stopped";
             realtimePlaybackCursor.value = null;
+            clearPendingSeekFallbackTimer();
             pendingSeekTarget.value = null;
             dropIncomingAudioUntilSeekStart = false;
             finishRealtimeStream();
@@ -3441,6 +3768,7 @@ function handleRealtimeEvent(event: RealtimeSessionState) {
                     event.status === "completed" ? "finished" : "stopped";
             }
             realtimePlaybackCursor.value = null;
+            clearPendingSeekFallbackTimer();
             pendingSeekTarget.value = null;
             dropIncomingAudioUntilSeekStart = false;
             finishRealtimeStream();
@@ -3448,6 +3776,7 @@ function handleRealtimeEvent(event: RealtimeSessionState) {
         case "error":
             realtimeStatus.value = "error";
             realtimePlaybackCursor.value = null;
+            clearPendingSeekFallbackTimer();
             pendingSeekTarget.value = null;
             dropIncomingAudioUntilSeekStart = false;
             realtimeError.value = event.message || "Realtime TTS gặp lỗi.";
@@ -3551,9 +3880,33 @@ watch(activeWordGlobalIndex, (nextWord, prevWord) => {
 watch(
     () => actualPlaybackLocation.value?.chapterId ?? null,
     (chapterId) => {
+        if (chapterId) {
+            realtimeAudibleChapterId.value = chapterId;
+            const chapterTitle =
+                sortedRealtimeChapterGroups.value.find(
+                    (group) => group.chapterId === chapterId,
+                )?.chapterTitle ??
+                selectedStory.value?.chapters.find(
+                    (chapter) => chapter.id === chapterId,
+                )?.title ??
+                "";
+            if (chapterTitle) {
+                realtimeAudibleChapterTitle.value = chapterTitle;
+            }
+        }
+
+        if (playbackAutoSyncLockChapterId.value !== null) {
+            if (chapterId === playbackAutoSyncLockChapterId.value) {
+                playbackAutoSyncLockChapterId.value = null;
+            } else {
+                return;
+            }
+        }
+
         if (
             !chapterId ||
             !isRealtimeActive.value ||
+            pendingSeekTarget.value !== null ||
             selectedChapterId.value === chapterId ||
             autoSyncingPlaybackChapterId.value === chapterId
         ) {
@@ -3881,7 +4234,7 @@ onUnmounted(() => {
                         :class="{
                             active:
                                 selectedChapterId === chapter.id ||
-                                realtimeCurrentChapterId === chapter.id,
+                                currentPlaybackChapterId === chapter.id,
                             'chapter-read': isChapterRead(chapter),
                         }"
                         @click="selectChapter(chapter.id, $event)"
@@ -3940,6 +4293,9 @@ onUnmounted(() => {
                                     }}
                                 </h3>
                                 <p>{{ chapterContent.storyTitle }}</p>
+                                <p v-if="bufferedAheadSummary">
+                                    {{ bufferedAheadSummary }}
+                                </p>
                             </div>
 
                             <section class="console-media-strip">
@@ -4287,20 +4643,9 @@ onUnmounted(() => {
                                             </div>
                                             <span
                                                 class="segment-status-badge"
-                                                :class="`is-${entry.group.status === 'completed' ? 'played' : entry.group.status}`"
+                                                :class="`is-${entry.displayState.tone}`"
                                             >
-                                                {{
-                                                    entry.group.status ===
-                                                    "reading"
-                                                        ? "Đang đọc"
-                                                        : entry.group.status ===
-                                                            "rendering"
-                                                          ? "Đang tạo tiếp"
-                                                          : entry.group.status ===
-                                                              "completed"
-                                                            ? "Đã xong"
-                                                            : "Đã tách"
-                                                }}
+                                                {{ entry.displayState.label }}
                                             </span>
                                         </div>
 
@@ -4310,7 +4655,7 @@ onUnmounted(() => {
                                                 :key="`${entry.group.chapterId}-segment-${segment.index}`"
                                                 class="segment-status-item"
                                                 :class="[
-                                                    `is-${segment.status}`,
+                                                    `is-${getDynamicSegmentStatus(segment.index, entry.group.chapterId)}`,
                                                     {
                                                         'is-active':
                                                             isSegmentNowPlaying(
@@ -4501,6 +4846,16 @@ onUnmounted(() => {
                                 </div>
 
                                 <div class="reader-actions">
+                                    <button
+                                        class="ghost-button reader-play-button"
+                                        :class="{
+                                            'is-playing':
+                                                readerPlayButtonIsPlaying,
+                                        }"
+                                        @click="handleReaderPlayAction"
+                                    >
+                                        {{ readerPlayButtonLabel }}
+                                    </button>
                                     <div class="reader-font-controls">
                                         <span>Cỡ chữ</span>
                                         <button
@@ -5299,6 +5654,16 @@ button:disabled {
 .reader-font-controls strong {
     font-size: 0.82rem;
     color: var(--text-secondary);
+}
+
+.reader-play-button {
+    min-width: 8rem;
+}
+
+.reader-play-button.is-playing {
+    color: #eff6ff;
+    border-color: rgba(96, 165, 250, 0.5);
+    background: rgba(59, 130, 246, 0.18);
 }
 
 .reader-font-controls strong {
@@ -6285,22 +6650,25 @@ button:disabled {
 
 .reader-word.is-active-word {
     background: transparent;
-    color: #f8fdff;
+    color: #ffffff;
     box-shadow: none;
     text-shadow:
-        0 0 1px rgba(255, 255, 255, 0.95),
-        0 0 8px rgba(125, 211, 252, 0.95),
-        0 0 16px rgba(56, 189, 248, 0.7),
-        0 0 24px rgba(34, 211, 238, 0.45);
+        0 0 2px rgba(255, 255, 255, 1),
+        0 0 6px rgba(255, 255, 255, 0.98),
+        0 0 12px rgba(103, 232, 249, 0.98),
+        0 0 20px rgba(34, 211, 238, 0.9),
+        0 0 32px rgba(14, 165, 233, 0.8),
+        0 0 44px rgba(59, 130, 246, 0.55);
 }
 
 .reader-word.is-active-segment {
     background: transparent;
-    color: #d9f7ff;
+    color: #9fe9ff;
     box-shadow: none;
     text-shadow:
-        0 0 1px rgba(255, 255, 255, 0.55),
-        0 0 6px rgba(103, 232, 249, 0.42);
+        0 0 1px rgba(255, 255, 255, 0.42),
+        0 0 5px rgba(103, 232, 249, 0.35),
+        0 0 10px rgba(34, 211, 238, 0.22);
 }
 
 .reader-word.is-active-segment.is-active-word {
@@ -6309,9 +6677,11 @@ button:disabled {
     box-shadow: none;
     text-shadow:
         0 0 2px rgba(255, 255, 255, 1),
-        0 0 10px rgba(125, 211, 252, 1),
-        0 0 18px rgba(56, 189, 248, 0.78),
-        0 0 28px rgba(34, 211, 238, 0.52);
+        0 0 8px rgba(255, 255, 255, 1),
+        0 0 16px rgba(125, 211, 252, 1),
+        0 0 26px rgba(34, 211, 238, 0.94),
+        0 0 38px rgba(14, 165, 233, 0.86),
+        0 0 52px rgba(59, 130, 246, 0.6);
 }
 
 .reader-paragraph {

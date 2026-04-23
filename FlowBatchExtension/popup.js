@@ -6,6 +6,9 @@ const STORAGE_KEYS = {
 const DEFAULT_CONFIG = {
   rawPrompts: "",
   galleryFilter: "",
+  downloadMethod: "direct-url",
+  directFormat: "jpg",
+  downloadQuality: "2k",
   selectedPromptIndex: -1,
   lastFilledPromptIndex: -1
 };
@@ -47,9 +50,15 @@ document.addEventListener("DOMContentLoaded", async () => {
     resetAllButton: document.getElementById("resetAllButton"),
     scannedCountValue: document.getElementById("scannedCountValue"),
     selectedCountValue: document.getElementById("selectedCountValue"),
+    downloadMethodSelect: document.getElementById("downloadMethodSelect"),
+    directFormatSelect: document.getElementById("directFormatSelect"),
+    downloadQualitySelect: document.getElementById("downloadQualitySelect"),
     messageBox: document.getElementById("messageBox"),
     scanSessionButton: document.getElementById("scanSessionButton"),
     downloadFromFlowButton: document.getElementById("downloadFromFlowButton"),
+    selectAllGalleryButton: document.getElementById("selectAllGalleryButton"),
+    clearSelectionButton: document.getElementById("clearSelectionButton"),
+    openDownloadsButton: document.getElementById("openDownloadsButton"),
     clearGalleryButton: document.getElementById("clearGalleryButton"),
     galleryCount: document.getElementById("galleryCount"),
     galleryContainer: document.getElementById("galleryContainer")
@@ -57,6 +66,9 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   ui.promptsInput.addEventListener("input", handlePromptsChanged);
   ui.galleryFilterInput.addEventListener("input", handleGalleryFilterChanged);
+  ui.downloadMethodSelect.addEventListener("change", handleDownloadOptionsChanged);
+  ui.directFormatSelect.addEventListener("change", handleDownloadOptionsChanged);
+  ui.downloadQualitySelect.addEventListener("change", handleDownloadQualityChanged);
   ui.fillSelectedPromptButton.addEventListener("click", handleFillSelectedPrompt);
   ui.fillNextPromptButton.addEventListener("click", handleFillNextPrompt);
   ui.runAllPromptsButton.addEventListener("click", handleRunAllPrompts);
@@ -64,6 +76,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   ui.resetAllButton.addEventListener("click", handleResetAll);
   ui.scanSessionButton.addEventListener("click", handleScanSessionImages);
   ui.downloadFromFlowButton.addEventListener("click", handleDownloadFromFlow);
+  ui.selectAllGalleryButton.addEventListener("click", handleSelectAllGallery);
+  ui.clearSelectionButton.addEventListener("click", handleClearSelection);
+  ui.openDownloadsButton.addEventListener("click", handleOpenDownloadsFolder);
   ui.clearGalleryButton.addEventListener("click", handleClearGallery);
   ui.galleryContainer.addEventListener("change", handleGalleryToggle);
   chrome.storage.onChanged.addListener(handleStorageChanged);
@@ -103,6 +118,9 @@ function normalizeConfig(config) {
   return {
     rawPrompts: String(config?.rawPrompts || ""),
     galleryFilter: String(config?.galleryFilter || ""),
+    downloadMethod: FlowBatchDownloadStrategy.normalizeDownloadMethod(config?.downloadMethod),
+    directFormat: FlowBatchDownloadStrategy.normalizeDirectFormat(config?.directFormat),
+    downloadQuality: FlowBatchDownloadStrategy.normalizeDownloadQuality(config?.downloadQuality),
     selectedPromptIndex: Number.isFinite(Number(config?.selectedPromptIndex)) ? Number(config.selectedPromptIndex) : -1,
     lastFilledPromptIndex: Number.isFinite(Number(config?.lastFilledPromptIndex)) ? Number(config.lastFilledPromptIndex) : -1
   };
@@ -111,6 +129,9 @@ function normalizeConfig(config) {
 function applyConfigToForm(config) {
   ui.promptsInput.value = config.rawPrompts || "";
   ui.galleryFilterInput.value = config.galleryFilter || "";
+  ui.downloadMethodSelect.value = FlowBatchDownloadStrategy.normalizeDownloadMethod(config.downloadMethod);
+  ui.directFormatSelect.value = FlowBatchDownloadStrategy.normalizeDirectFormat(config.directFormat);
+  ui.downloadQualitySelect.value = FlowBatchDownloadStrategy.normalizeDownloadQuality(config.downloadQuality);
 }
 
 function handlePromptsChanged() {
@@ -127,6 +148,17 @@ function handleGalleryFilterChanged() {
   persistConfigDebounced();
   renderPromptPreview();
   renderGallery();
+}
+
+function handleDownloadQualityChanged() {
+  cache.config.downloadQuality = FlowBatchDownloadStrategy.normalizeDownloadQuality(ui.downloadQualitySelect.value);
+  persistConfigDebounced();
+}
+
+function handleDownloadOptionsChanged() {
+  cache.config.downloadMethod = FlowBatchDownloadStrategy.normalizeDownloadMethod(ui.downloadMethodSelect.value);
+  cache.config.directFormat = FlowBatchDownloadStrategy.normalizeDirectFormat(ui.directFormatSelect.value);
+  persistConfigDebounced();
 }
 
 async function handleScanSessionImages() {
@@ -270,7 +302,7 @@ async function handleResetAll() {
     [STORAGE_KEYS.results]: []
   });
   renderAll();
-  setMessage("Đã reset toàn bộ prompt, bộ lọc, gallery và trạng thái chọn.", "success");
+  setMessage("Đã reset toàn bộ prompt, bộ lọc, chất lượng tải, gallery và trạng thái chọn.", "success");
 }
 
 async function handleDownloadFromFlow() {
@@ -280,25 +312,116 @@ async function handleDownloadFromFlow() {
       throw new Error("Hãy chọn ít nhất một ảnh trong gallery trước khi tải.");
     }
 
+    const downloadMethod = FlowBatchDownloadStrategy.normalizeDownloadMethod(cache.config.downloadMethod);
+    if (downloadMethod === "direct-url") {
+      await downloadSelectedItemsDirectly(selectedItems);
+      return;
+    }
+
+    const downloadQuality = FlowBatchDownloadStrategy.normalizeDownloadQuality(cache.config.downloadQuality);
     const tab = await getActiveTab();
     assertTabIsScriptable(tab);
     await ensureContentScript(tab.id);
 
     const response = await tabsSendMessage(tab.id, {
       type: "FLOW_DOWNLOAD_SELECTED_FROM_FLOW",
-      payload: { items: selectedItems }
+      payload: {
+        items: selectedItems,
+        options: { quality: downloadQuality }
+      }
     });
 
     if (!response?.ok) {
       throw new Error(response?.error || "Flow không trả về kết quả tải ảnh.");
     }
 
+    const downloadedCount = response.downloadedCount || 0;
     setMessage(
-      `Đã kích hoạt tải ${response.downloadedCount || 0}/${selectedItems.length} ảnh trực tiếp từ Flow.`,
+      `Đã kích hoạt tải ${downloadedCount}/${selectedItems.length} ảnh qua menu Flow (${downloadQuality.toUpperCase()}).`,
       "success"
     );
   } catch (error) {
     setMessage(error.message || "Không thể tải ảnh đã chọn từ Flow.", "error");
+  }
+}
+
+async function downloadSelectedItemsDirectly(selectedItems) {
+  const directFormat = FlowBatchDownloadStrategy.normalizeDirectFormat(cache.config.directFormat);
+  const preparedItems = directFormat === "jpg"
+    ? selectedItems.map((item) => ({ ...item, preferredExtension: "jpg" }))
+    : await convertItemsForDownload(selectedItems, directFormat);
+
+  const response = await runtimeSendMessage({
+    type: "DOWNLOAD_SELECTED",
+    payload: {
+      items: preparedItems,
+      options: { preferredExtension: directFormat }
+    }
+  });
+
+  if (!response?.ok) {
+    throw new Error(response?.error || "Tải URL trực tiếp thất bại.");
+  }
+
+  const downloadCount = Array.isArray(response.downloadIds) ? response.downloadIds.length : 0;
+  const errorCount = Array.isArray(response.errors) ? response.errors.length : 0;
+  const suffix = errorCount > 0 ? ` Có ${errorCount} ảnh lỗi.` : "";
+  setMessage(`Đã tải trực tiếp ${downloadCount}/${selectedItems.length} ảnh dạng ${directFormat.toUpperCase()}.${suffix}`, errorCount ? "default" : "success");
+}
+
+async function convertItemsForDownload(items, format) {
+  const convertedItems = [];
+
+  for (const item of items) {
+    const dataUrl = await convertImageUrlToDataUrl(item.imageUrl, format);
+    convertedItems.push({
+      ...item,
+      imageUrl: dataUrl,
+      preferredExtension: format
+    });
+  }
+
+  return convertedItems;
+}
+
+async function convertImageUrlToDataUrl(imageUrl, format) {
+  const response = await fetch(imageUrl);
+  if (!response.ok) {
+    throw new Error(`Không tải được ảnh để convert: HTTP ${response.status}.`);
+  }
+
+  const blob = await response.blob();
+  const bitmap = await createImageBitmap(blob);
+  const canvas = document.createElement("canvas");
+  canvas.width = bitmap.width;
+  canvas.height = bitmap.height;
+  const context = canvas.getContext("2d");
+  context.drawImage(bitmap, 0, 0);
+  bitmap.close?.();
+
+  const mimeType = format === "webp" ? "image/webp" : "image/png";
+  return canvas.toDataURL(mimeType, 0.95);
+}
+
+async function handleSelectAllGallery() {
+  const visibleIds = new Set(getVisibleResults().map((item) => item.id));
+  cache.results = cache.results.map((item) => visibleIds.has(item.id) ? { ...item, selected: true } : item);
+  await storageSet({ [STORAGE_KEYS.results]: cache.results });
+  renderAll();
+  setMessage(`Đã chọn ${visibleIds.size} ảnh đang hiển thị.`, "success");
+}
+
+async function handleClearSelection() {
+  cache.results = cache.results.map((item) => ({ ...item, selected: false }));
+  await storageSet({ [STORAGE_KEYS.results]: cache.results });
+  renderAll();
+  setMessage("Đã bỏ chọn toàn bộ ảnh.", "default");
+}
+
+async function handleOpenDownloadsFolder() {
+  const response = await runtimeSendMessage({ type: "SHOW_DOWNLOADS_FOLDER" });
+  if (!response?.ok) {
+    setMessage(response?.error || "Không mở được thư mục Downloads.", "error");
   }
 }
 
@@ -492,6 +615,8 @@ function getVisibleResults() {
 function syncActionState() {
   const selectedCount = cache.results.filter((item) => item.selected).length;
   ui.downloadFromFlowButton.disabled = selectedCount === 0;
+  ui.selectAllGalleryButton.disabled = getVisibleResults().length === 0;
+  ui.clearSelectionButton.disabled = selectedCount === 0;
   ui.clearGalleryButton.disabled = cache.results.length === 0;
 
   const entries = getPromptEntriesSafe();
@@ -500,7 +625,12 @@ function syncActionState() {
   ui.fillNextPromptButton.disabled = !hasPrompts;
   ui.runAllPromptsButton.disabled = !hasPrompts;
   ui.stopPromptRunButton.disabled = false;
-  ui.resetAllButton.disabled = !cache.config.rawPrompts.trim() && !cache.config.galleryFilter.trim() && cache.results.length === 0;
+  ui.resetAllButton.disabled = !cache.config.rawPrompts.trim()
+    && !cache.config.galleryFilter.trim()
+    && cache.config.downloadMethod === DEFAULT_CONFIG.downloadMethod
+    && cache.config.directFormat === DEFAULT_CONFIG.directFormat
+    && cache.config.downloadQuality === DEFAULT_CONFIG.downloadQuality
+    && cache.results.length === 0;
 }
 
 function getPromptEntriesSafe() {
@@ -755,7 +885,7 @@ async function ensureContentScript(tabId) {
   } catch (error) {
     await chrome.scripting.executeScript({
       target: { tabId },
-      files: ["content.js"]
+      files: ["composerResolver.js", "editorStrategy.js", "content.js"]
     });
   }
 
@@ -817,6 +947,20 @@ function normalizeText(value) {
 function tabsSendMessage(tabId, message) {
   return new Promise((resolve, reject) => {
     chrome.tabs.sendMessage(tabId, message, (response) => {
+      const lastError = chrome.runtime.lastError;
+      if (lastError) {
+        reject(new Error(lastError.message));
+        return;
+      }
+
+      resolve(response);
+    });
+  });
+}
+
+function runtimeSendMessage(message) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(message, (response) => {
       const lastError = chrome.runtime.lastError;
       if (lastError) {
         reject(new Error(lastError.message));

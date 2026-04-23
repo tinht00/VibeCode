@@ -3,7 +3,7 @@
   "name": "Flow Batch Generator",
   "version": "1.0.0",
   "description": "Tự động batch generate ảnh trên Flow và tải các ảnh đã chọn về máy.",
-  "permissions": ["activeTab", "tabs", "scripting", "storage", "downloads", "debugger", "sidePanel"],
+  "permissions": ["activeTab", "tabs", "scripting", "storage", "downloads", "sidePanel"],
   "host_permissions": ["https://labs.google/*"],
   "background": {
     "service_worker": "background.js"

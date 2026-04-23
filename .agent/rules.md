@@ -16,6 +16,12 @@ Các quy chuẩn kỹ thuật cứng (Hard Rules) mà mọi lập trình viên v
 *   Ưu tiên code dễ đọc (Readability) hơn code ngắn gọn nhưng khó hiểu (Cleverness).
 *   Không được giấu lỗi (Swallow errors); lỗi phải được xử lý hoặc báo cáo rõ ràng.
 
+### 1.1. Bốn nguyên tắc hành vi kiểu Karpathy
+*   **Nghĩ trước khi code**: Nêu rõ giả định, điểm mơ hồ và rủi ro chính trước khi sửa; nếu có nhiều cách hiểu thì phải làm rõ thay vì chọn ngầm.
+*   **Ưu tiên đơn giản**: Chỉ thêm đúng lượng code, docs và cấu hình cần thiết; tránh abstraction hoặc flexibility chưa có nhu cầu thật.
+*   **Chỉnh sửa đúng phạm vi**: Chỉ chạm những file và đoạn liên quan trực tiếp; không tiện tay refactor hoặc dọn dẹp phần ngoài task.
+*   **Làm việc theo tiêu chí kiểm chứng được**: Xác định cách verify trước khi triển khai và có bằng chứng kiểm tra phù hợp trước khi kết luận xong việc.
+
 ### 2. Quy tắc theo công nghệ (Tech Stack Rules)
 
 #### 🟢 Vue 3 + Vite (Frontend Web)
@@ -145,3 +151,4 @@ Khi báo lỗi cho AI, hãy cung cấp đủ:
     *   *Ví dụ: `def process(data: dict) -> list:`*
 *   Viết bằng tiếng Việt tối ưu thân thiện dễ hiểu.
 *   Luôn cập nhật docs và comment của tất cả chức năng bao gồm chức năng mới sau khi cập nhật code.
+

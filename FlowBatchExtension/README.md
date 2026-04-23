@@ -6,6 +6,26 @@
 - Runtime áp dụng `Math.max(delayMs, longPauseMs)` để bảo đảm mốc nghỉ dài không bao giờ ngắn hơn nhịp mặc định.
 - Logic áp dụng trong luồng `FLOW_AUTOFILL_PROMPTS`.
 
+## Composer resolver mới
+- Extension không còn phụ thuộc vào quyền `debugger` của Chrome để gõ prompt hoặc click cưỡng bức.
+- Luồng mới ưu tiên nhớ đúng composer mà người dùng vừa focus/tương tác, sau đó chọn prompt và nút submit trong cùng composer đó.
+- Resolver thuần nằm ở `composerResolver.js` để có thể test độc lập trước khi nối vào `content.js`.
+- Strategy ghi prompt nằm ở `editorStrategy.js`; editor kiểu rich text sẽ ưu tiên `insertText` thay vì gán `textContent` trực tiếp.
+
+## Giao diện và tải ảnh
+- Side panel chia thành 3 vùng: Prompt Queue, Download và Gallery.
+- Gallery có thao tác nhanh: chọn tất cả ảnh đang hiển thị, bỏ chọn, xóa gallery và mở thư mục tải.
+- Khi tải ảnh, popup mặc định dùng URL trực tiếp như luồng ban đầu nhưng đặt đuôi `.jpg` thay vì `.jfif`.
+- Có thể chọn định dạng tải trực tiếp `JPG`, `PNG` hoặc `WebP`; `PNG/WebP` sẽ convert ảnh trong popup trước khi tải.
+- Vẫn có thể chuyển sang cách tải bằng menu Flow và chọn chất lượng `1K Original` hoặc `2K Upscaled`.
+- `downloadStrategy.js` giữ các helper nhỏ cho chuẩn hóa cách tải, định dạng và chất lượng.
+- Luồng crop tự động đã được loại bỏ khỏi message handler và giao diện chính.
+
+## Kiểm tra nhanh
+- Chạy test resolver: `node --test tests/composerResolver.test.js`
+- Chạy test download strategy: `node --test tests/downloadStrategy.test.js`
+- Sau khi sửa mã extension, vẫn cần reload lại extension trong `chrome://extensions` và refresh lại tab Flow đang mở.
+
 ## Ghi chú debug nhanh
 ### Case 1: Thấy extension vẫn chạy nhịp cũ
 - Dấu hiệu nhận biết: popup hiển thị nhịp cũ hoặc log chạy không đúng pattern `15 giây/prompt`, `25 giây` sau mỗi cụm `5 prompt`.

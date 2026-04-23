@@ -138,10 +138,22 @@
     "a client-side exception has occurred while loading labs.google"
   ];
 
+  const composerResolver = window.FlowBatchComposerResolver || null;
+  const editorStrategy = window.FlowBatchEditorStrategy || null;
+  const runtimeElementIds = new WeakMap();
+  let runtimeElementIdCounter = 0;
+
   const runtimeState = {
     isRunning: false,
     stopRequested: false,
-    sidebarMounted: false
+    sidebarMounted: false,
+    composerTrackingEnabled: false,
+    composerMemory: {
+      composerId: "",
+      promptId: "",
+      actionId: "",
+      updatedAt: 0
+    }
   };
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -216,17 +228,211 @@
       return false;
     }
 
-    if (message.type === "FLOW_DOWNLOAD_SELECTED_FROM_FLOW" || message.type === "FLOW_CROP_SQUARE_AND_DOWNLOAD_CURRENT") {
-      void automateDownloadSelectedItemsFromFlow(message.payload?.items)
+    if (message.type === "FLOW_DOWNLOAD_SELECTED_FROM_FLOW") {
+      void automateDownloadSelectedItemsFromFlow(message.payload?.items, message.payload?.options)
         .then((result) => sendResponse({ ok: true, ...result }))
-        .catch((error) => sendResponse({ ok: false, error: error.message || "Không thể tải ảnh đã chọn trực tiếp từ Flow." }));
+        .catch((error) => sendResponse({ ok: false, error: error.message || "Không thể tải ảnh đã chọn bằng menu Flow." }));
       return true;
     }
 
     return false;
   });
 
-  removeLegacySidebarHost();
+  function installComposerTracking() {
+    if (runtimeState.composerTrackingEnabled) {
+      return;
+    }
+
+    document.addEventListener("focusin", handleComposerFocus, true);
+    document.addEventListener("input", handleComposerFocus, true);
+    document.addEventListener("pointerdown", handleComposerPointer, true);
+    runtimeState.composerTrackingEnabled = true;
+  }
+
+  function ensureComposerTracking() {
+    installComposerTracking();
+  }
+
+  function handleComposerFocus(event) {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) {
+      return;
+    }
+
+    if (isPromptLikeElement(target)) {
+      rememberPromptElement(target);
+    }
+  }
+
+  function handleComposerPointer(event) {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) {
+      return;
+    }
+
+    const promptTarget = target.closest("input, textarea, [contenteditable='true'], [role='textbox']");
+    if (promptTarget instanceof HTMLElement && isPromptLikeElement(promptTarget)) {
+      rememberPromptElement(promptTarget);
+      return;
+    }
+
+    const actionTarget = target.closest("button, [role='button']");
+    if (actionTarget instanceof HTMLElement && isLikelyActionButton(actionTarget)) {
+      rememberActionElement(actionTarget);
+    }
+  }
+
+  function rememberPromptElement(element) {
+    if (!(element instanceof HTMLElement)) {
+      return;
+    }
+
+    const composerRoot = findComposerRoot(element);
+    runtimeState.composerMemory = {
+      ...runtimeState.composerMemory,
+      promptId: getRuntimeElementId(element),
+      composerId: composerRoot instanceof HTMLElement ? getRuntimeElementId(composerRoot) : runtimeState.composerMemory.composerId,
+      updatedAt: Date.now()
+    };
+  }
+
+  function rememberActionElement(element, promptElement = null) {
+    if (!(element instanceof HTMLElement)) {
+      return;
+    }
+
+    const promptTarget = promptElement instanceof HTMLElement ? promptElement : findPromptInput();
+    const composerRoot = resolveActionComposerRoot(element, promptTarget);
+    runtimeState.composerMemory = {
+      ...runtimeState.composerMemory,
+      actionId: getRuntimeElementId(element),
+      composerId: composerRoot instanceof HTMLElement ? getRuntimeElementId(composerRoot) : runtimeState.composerMemory.composerId,
+      updatedAt: Date.now()
+    };
+  }
+
+  function getRuntimeElementId(element) {
+    if (!(element instanceof HTMLElement)) {
+      return "";
+    }
+
+    const existing = runtimeElementIds.get(element);
+    if (existing) {
+      return existing;
+    }
+
+    runtimeElementIdCounter += 1;
+    const nextId = `flow-runtime-${runtimeElementIdCounter}`;
+    runtimeElementIds.set(element, nextId);
+    return nextId;
+  }
+
+  function buildPromptDescriptor(element) {
+    const composerRoot = findComposerRoot(element);
+    return {
+      id: getRuntimeElementId(element),
+      composerId: composerRoot instanceof HTMLElement ? getRuntimeElementId(composerRoot) : "",
+      tagName: element.tagName.toLowerCase(),
+      role: element.getAttribute("role") || "",
+      type: element.getAttribute("type") || "",
+      text: getElementText(element),
+      ariaLabel: element.getAttribute("aria-label") || "",
+      placeholder: element.getAttribute("placeholder") || "",
+      title: element.getAttribute("title") || "",
+      isContentEditable: element.isContentEditable,
+      isVisible: isVisible(element),
+      rect: toRectSnapshot(element)
+    };
+  }
+
+  function buildActionDescriptor(element, promptInput) {
+    const composerRoot = resolveActionComposerRoot(element, promptInput);
+    return {
+      id: getRuntimeElementId(element),
+      composerId: composerRoot instanceof HTMLElement ? getRuntimeElementId(composerRoot) : "",
+      tagName: element.tagName.toLowerCase(),
+      role: element.getAttribute("role") || "",
+      type: element.getAttribute("type") || "",
+      text: getElementText(element),
+      ariaLabel: element.getAttribute("aria-label") || "",
+      placeholder: element.getAttribute("placeholder") || "",
+      title: element.getAttribute("title") || "",
+      isContentEditable: false,
+      isVisible: isVisible(element),
+      rect: toRectSnapshot(element)
+    };
+  }
+
+  function toRectSnapshot(element) {
+    const rect = element.getBoundingClientRect();
+    return {
+      top: rect.top,
+      right: rect.right,
+      bottom: rect.bottom,
+      left: rect.left,
+      width: rect.width,
+      height: rect.height
+    };
+  }
+
+  function resolveActionComposerRoot(element, promptInput) {
+    if (!(element instanceof HTMLElement)) {
+      return null;
+    }
+
+    if (promptInput instanceof HTMLElement) {
+      const promptComposer = findComposerRoot(promptInput);
+      if (promptComposer instanceof HTMLElement && promptComposer.contains(element)) {
+        return promptComposer;
+      }
+    }
+
+    return findCandidateComposerRoot(element);
+  }
+
+  function findCandidateComposerRoot(element) {
+    let current = element;
+
+    for (let depth = 0; current && depth < 7; depth += 1) {
+      const parent = current.parentElement;
+      if (!(parent instanceof HTMLElement)) {
+        break;
+      }
+
+      const visiblePromptCount = Array.from(
+        parent.querySelectorAll("input, textarea, [contenteditable='true'], [role='textbox']")
+      ).filter((child) => child instanceof HTMLElement && isVisible(child)).length;
+      const visibleButtonCount = Array.from(parent.querySelectorAll("button, [role='button']"))
+        .filter((child) => isVisible(child))
+        .length;
+
+      if (visiblePromptCount > 0 && visibleButtonCount > 0) {
+        return parent;
+      }
+
+      current = parent;
+    }
+
+    return null;
+  }
+
+  function isLikelyActionButton(element) {
+    if (!(element instanceof HTMLElement)) {
+      return false;
+    }
+
+    const descriptor = buildActionDescriptor(element, findPromptInput());
+    if (!composerResolver?.scoreGenerateButtonCandidate) {
+      return !isDisallowedGenerateCandidate(element);
+    }
+
+    return composerResolver.scoreGenerateButtonCandidate(descriptor, null, {
+      rememberedComposerId: runtimeState.composerMemory.composerId,
+      rememberedActionId: runtimeState.composerMemory.actionId,
+      viewportHeight: window.innerHeight,
+      viewportWidth: window.innerWidth
+    }) > 8;
+  }
 
   async function validateStartRequest(payload) {
     if (runtimeState.isRunning) {
@@ -241,6 +447,7 @@
     }
 
     validatePageContext();
+    ensureComposerTracking();
     await ensureComposerReady();
 
     if (!findPromptInput()) {
@@ -267,6 +474,7 @@
     }
 
     validatePageContext();
+    ensureComposerTracking();
     await ensureComposerReady();
     const promptInput = await populatePromptEditor(prompt);
     if (!promptInput) {
@@ -290,6 +498,7 @@
     }
 
     validatePageContext();
+    ensureComposerTracking();
     await ensureComposerReady();
 
     if (!findPromptInput()) {
@@ -329,9 +538,8 @@
       }
 
       await wait(FLOW_TIMING.interactionDelayMs);
-      await submitPromptOnce();
+      await submitPromptWithRetry(prompt);
       await wait(500);
-      await clearPromptComposerForAutofill();
 
       if (index >= prompts.length - 1) {
         continue;
@@ -405,10 +613,6 @@
     if (!window.location.href.includes("/tools/flow/")) {
       throw new Error("Tab hiện tại không phải trang Flow. Hãy mở đúng project Flow rồi chạy extension.");
     }
-  }
-
-  function removeLegacySidebarHost() {
-    document.getElementById("flow-batch-sidebar-host")?.remove();
   }
 
   async function ensureComposerReady() {
@@ -803,7 +1007,7 @@
           continue;
         }
 
-        await typePromptWithDebugger(target, prompt);
+        await typePromptIntoElement(target, prompt);
         await wait(180);
 
         if (promptLooksApplied(readPromptValue(target), prompt)) {
@@ -827,7 +1031,7 @@
           continue;
         }
 
-        await typePromptWithDebugger(target, prompt);
+        await typePromptIntoElement(target, prompt);
         await wait(120);
       } catch (error) {
         console.warn("Không reinforce được prompt cho candidate:", candidate, error);
@@ -879,6 +1083,7 @@
 
     const activeElement = document.activeElement;
     if (activeElement instanceof HTMLElement && isPromptLikeElement(activeElement)) {
+      rememberPromptElement(activeElement);
       return activeElement;
     }
 
@@ -889,25 +1094,40 @@
     if (nestedEditable instanceof HTMLElement) {
       nestedEditable.click?.();
       nestedEditable.focus?.();
+      rememberPromptElement(nestedEditable);
       return nestedEditable;
     }
 
     return null;
   }
 
-  async function typePromptWithDebugger(element, value) {
+  async function typePromptIntoElement(element, value) {
+    if (!(element instanceof HTMLElement)) {
+      throw new Error("Editor prompt không hợp lệ.");
+    }
+
     element.click?.();
     element.focus?.();
+    rememberPromptElement(element);
     await wait(80);
 
-    const response = await runtimeSendMessage({
-      type: "FLOW_DEBUGGER_TYPE",
-      payload: { text: value }
-    });
+    const strategy = editorStrategy?.getPromptWriteStrategy?.({
+      tagName: element.tagName.toLowerCase(),
+      role: element.getAttribute("role") || "",
+      isContentEditable: element.isContentEditable
+    }) || "unsupported";
 
-    if (!response?.ok) {
-      throw new Error(response?.error || "Không thể gõ prompt bằng chrome.debugger.");
+    if (strategy === "native-value-setter" && (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)) {
+      setNativeInputValue(element, value);
+      return;
     }
+
+    if (strategy === "contenteditable-insert-text" && (element.isContentEditable || element.getAttribute("role") === "textbox")) {
+      setContentEditableValue(element, value);
+      return;
+    }
+
+    throw new Error("Không tìm thấy kiểu editor được hỗ trợ để điền prompt.");
   }
 
   async function bestEffortSelectValue(options) {
@@ -983,9 +1203,45 @@
   }
 
   function getPromptCandidates() {
-    return findVisibleElements(FLOW_HINTS.promptInput)
-      .filter((element) => element instanceof HTMLElement)
-      .sort((a, b) => scorePromptCandidate(b) - scorePromptCandidate(a));
+    const candidates = findVisibleElements(FLOW_HINTS.promptInput)
+      .filter((element) => element instanceof HTMLElement);
+
+    if (!composerResolver?.pickPromptCandidate) {
+      return candidates.sort((a, b) => scorePromptCandidate(b) - scorePromptCandidate(a));
+    }
+
+    const descriptors = candidates.map((element) => ({
+      element,
+      descriptor: buildPromptDescriptor(element)
+    }));
+    const picked = composerResolver.pickPromptCandidate(
+      descriptors.map((entry) => entry.descriptor),
+      {
+        rememberedPromptId: runtimeState.composerMemory.promptId,
+        rememberedComposerId: runtimeState.composerMemory.composerId,
+        viewportHeight: window.innerHeight
+      }
+    );
+
+    if (!picked) {
+      return candidates.sort((a, b) => scorePromptCandidate(b) - scorePromptCandidate(a));
+    }
+
+    const pickedEntry = descriptors.find((entry) => entry.descriptor.id === picked.id);
+    const remaining = descriptors
+      .filter((entry) => entry.descriptor.id !== picked.id)
+      .sort((a, b) => composerResolver.scorePromptCandidate(b.descriptor, {
+        rememberedPromptId: runtimeState.composerMemory.promptId,
+        rememberedComposerId: runtimeState.composerMemory.composerId,
+        viewportHeight: window.innerHeight
+      }) - composerResolver.scorePromptCandidate(a.descriptor, {
+        rememberedPromptId: runtimeState.composerMemory.promptId,
+        rememberedComposerId: runtimeState.composerMemory.composerId,
+        viewportHeight: window.innerHeight
+      }))
+      .map((entry) => entry.element);
+
+    return pickedEntry ? [pickedEntry.element, ...remaining] : remaining;
   }
 
   function scorePromptCandidate(element) {
@@ -1035,12 +1291,46 @@
   function findGenerateButton() {
     const promptInput = findPromptInput();
     const composerRoot = findComposerRoot(promptInput);
+
+    if (composerResolver?.pickGenerateButtonCandidate) {
+      const scopes = uniqueElements([
+        composerRoot instanceof HTMLElement ? composerRoot : null,
+        promptInput instanceof HTMLElement ? promptInput.closest("form") : null,
+        ...(promptInput instanceof HTMLElement ? collectAncestorCandidates(promptInput, 6) : [])
+      ].filter(Boolean));
+      const scopedButtons = scopes.flatMap((scope) => Array.from(scope.querySelectorAll("button, [role='button']")));
+      const directButtons = findVisibleElements(FLOW_HINTS.generateButton);
+      const allButtons = uniqueElements([...directButtons, ...scopedButtons])
+        .filter((button) => button instanceof HTMLElement)
+        .filter((button) => isVisible(button))
+        .filter((button) => !isDisallowedGenerateCandidate(button));
+      const descriptors = allButtons.map((button) => ({
+        button,
+        descriptor: buildActionDescriptor(button, promptInput)
+      }));
+      const promptDescriptor = promptInput instanceof HTMLElement ? buildPromptDescriptor(promptInput) : null;
+      const picked = composerResolver.pickGenerateButtonCandidate(
+        descriptors.map((entry) => entry.descriptor),
+        promptDescriptor,
+        {
+          rememberedComposerId: runtimeState.composerMemory.composerId,
+          rememberedActionId: runtimeState.composerMemory.actionId,
+          viewportHeight: window.innerHeight,
+          viewportWidth: window.innerWidth
+        }
+      );
+
+      if (picked) {
+        return descriptors.find((entry) => entry.descriptor.id === picked.id)?.button || null;
+      }
+    }
+
     const exactComposerButton = findExactComposerGenerateButton(promptInput, composerRoot);
     if (exactComposerButton) {
       return exactComposerButton;
     }
-    const promptNeighbor = findGenerateButtonNearPrompt(promptInput, composerRoot);
 
+    const promptNeighbor = findGenerateButtonNearPrompt(promptInput, composerRoot);
     if (promptNeighbor) {
       return promptNeighbor;
     }
@@ -1382,38 +1672,50 @@
       throw new Error("Nút Generate tìm thấy không nằm trong composer hiện tại.");
     }
 
-    await clickGenerateActionButton(button);
+    await clickGenerateActionButton(button, promptInput);
     await wait(FLOW_TIMING.interactionDelayMs);
   }
 
-  async function clickGenerateActionButton(button) {
+  async function clickGenerateActionButton(button, promptInput = null) {
     if (!(button instanceof HTMLElement)) {
       throw new Error("Nút Generate không hợp lệ.");
     }
 
     button.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
-    const rect = button.getBoundingClientRect();
-    const clientX = rect.left + rect.width / 2;
-    const clientY = rect.top + rect.height / 2;
-    const topElement = document.elementFromPoint(clientX, clientY);
-    if (topElement instanceof Element && !button.contains(topElement) && !topElement.contains(button)) {
-      throw new Error("Tọa độ tâm của nút Generate hiện không trỏ đúng vào nút. Dừng để tránh click nhầm.");
-    }
-
     button.focus?.();
+    rememberActionElement(button, promptInput);
 
-    const response = await runtimeSendMessage({
-      type: "FLOW_DEBUGGER_CLICK_AT",
-      payload: { x: clientX, y: clientY }
-    });
-
-    if (response?.ok) {
-      await wait(320);
-      return;
+    if (button instanceof HTMLButtonElement && button.form instanceof HTMLFormElement) {
+      button.form.requestSubmit(button);
+      await wait(260);
+      if (isGenerationPending()) {
+        return;
+      }
     }
 
-    button.click();
+    dispatchClickSequence(button);
     await wait(320);
+  }
+
+  function dispatchClickSequence(element) {
+    const rect = element.getBoundingClientRect();
+    const eventOptions = {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      view: window,
+      clientX: rect.left + rect.width / 2,
+      clientY: rect.top + rect.height / 2
+    };
+
+    if (typeof PointerEvent === "function") {
+      element.dispatchEvent(new PointerEvent("pointerdown", { ...eventOptions, pointerId: 1, pointerType: "mouse", isPrimary: true }));
+      element.dispatchEvent(new PointerEvent("pointerup", { ...eventOptions, pointerId: 1, pointerType: "mouse", isPrimary: true }));
+    }
+
+    element.dispatchEvent(new MouseEvent("mousedown", eventOptions));
+    element.dispatchEvent(new MouseEvent("mouseup", eventOptions));
+    element.dispatchEvent(new MouseEvent("click", eventOptions));
   }
 
   async function ensureSettingsPanelOpen() {
@@ -1847,7 +2149,7 @@
 
   async function clearPromptTarget(target) {
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      await typePromptWithDebugger(target, "");
+      await typePromptIntoElement(target, "");
       await wait(180);
 
       const currentValue = normalizeText(readPromptValue(target));
@@ -1861,8 +2163,7 @@
 
   async function forceClearPromptTarget(target) {
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      await typePromptWithDebugger(target, "");
-      dispatchPromptEvents(target, "");
+      await typePromptIntoElement(target, "");
       await wait(220);
 
       const currentValue = normalizeText(readPromptValue(target));
@@ -1949,7 +2250,7 @@
     });
   }
 
-  async function automateDownloadSelectedItemsFromFlow(items = []) {
+  async function automateDownloadSelectedItemsFromFlow(items = [], options = {}) {
     validatePageContext();
 
     const selectedItems = Array.isArray(items) ? items.filter(Boolean) : [];
@@ -1957,10 +2258,11 @@
       throw new Error("Chưa có ảnh nào được chọn để tải.");
     }
 
+    const quality = normalizeDownloadQuality(options?.quality);
     let downloadedCount = 0;
 
     for (const item of selectedItems) {
-      await triggerDirectDownloadForItem(item);
+      await triggerFlowMenuDownloadForItem(item, quality);
       downloadedCount += 1;
       await wait(650);
     }
@@ -1972,43 +2274,38 @@
     };
   }
 
-  async function triggerDirectDownloadForItem(item) {
+  async function triggerFlowMenuDownloadForItem(item, quality) {
     const target = findGalleryTargetForItem(item);
     if (!(target instanceof HTMLElement)) {
       throw new Error(`Không tìm thấy card ảnh trên Flow cho mục: ${item.promptLabel || item.prompt || item.imageUrl}`);
     }
 
-    const cardRoot = findInteractiveCard(target) || findMediaCardRoot(target) || target;
+    const cardRoot = findStrictMediaCardRoot(target) || findMediaCardRoot(target) || findInteractiveCard(target) || target;
     revealCardActionLayer(cardRoot);
     await wait(FLOW_TIMING.directDownloadActionDelayMs);
 
-    const menuButton = await waitForElement(
-      () => findCardMenuButton(cardRoot),
-      4000,
-      "Không tìm thấy nút Tạo thêm trên card ảnh đã chọn."
-    );
-    await clickElementRobustly(menuButton);
-    await waitForElement(
-      () => findOpenCardMenu(menuButton),
-      4000,
+    const menuState = await waitForElement(
+      () => tryOpenCardMenu(cardRoot),
+      5000,
       "Đã hover vào card nhưng chưa mở được menu Tạo thêm."
     );
 
-    const downloadEntry = await waitForElement(
-      () => findDirectDownloadMenuItem(),
-      5000,
-      "Không tìm thấy mục Tải xuống trong menu của card ảnh."
-    );
+    const downloadEntry = menuState.downloadEntry;
     await hoverElementRobustly(downloadEntry);
 
     const qualityOption = await waitForElement(
-      () => findDownloadQualityOption(downloadEntry),
+      () => findDownloadQualityOption(downloadEntry, quality),
       5000,
-      "Đã mở menu Tải xuống nhưng chưa thấy đúng nút 2K Upscaled."
+      `Đã mở menu Tải xuống nhưng chưa thấy đúng nút ${quality.toUpperCase()}.`
     );
 
     await clickExactMenuItem(qualityOption);
     await wait(FLOW_TIMING.directDownloadActionDelayMs);
+  }
+
+  function normalizeDownloadQuality(value) {
+    const normalized = String(value || "").trim().toLowerCase();
+    return normalized === "1k" ? "1k" : "2k";
   }
 
   function extractSessionPromptFromElement(element) {
@@ -2072,6 +2369,75 @@
     return scored[0]?.element || element;
   }
 
+  function findStrictMediaCardRoot(element) {
+    if (!(element instanceof HTMLElement)) {
+      return null;
+    }
+
+    const mediaElement = element.matches("img, video, canvas")
+      ? element
+      : element.querySelector("img, video, canvas");
+    const mediaRect = (mediaElement instanceof HTMLElement ? mediaElement : element).getBoundingClientRect();
+    const candidates = [];
+    let current = element;
+
+    while (current) {
+      candidates.push(current);
+      current = current.parentElement;
+    }
+
+    const scored = uniqueElements(candidates)
+      .filter((candidate) => candidate instanceof HTMLElement && isVisible(candidate))
+      .map((candidate) => ({
+        element: candidate,
+        score: scoreStrictMediaCardRoot(candidate, mediaRect)
+      }))
+      .filter((entry) => entry.score > 0)
+      .sort((a, b) => b.score - a.score);
+
+    return scored[0]?.element || null;
+  }
+
+  function scoreStrictMediaCardRoot(element, mediaRect) {
+    const rect = element.getBoundingClientRect();
+    const imageCount = element.querySelectorAll("img, video, canvas").length;
+    let score = 0;
+
+    if (rect.width >= 120 && rect.width <= 420 && rect.height >= 120 && rect.height <= 420) {
+      score += 35;
+    }
+
+    if (rect.width > 520 || rect.height > 520 || rect.width > window.innerWidth * 0.45 || rect.height > window.innerHeight * 0.55) {
+      score -= 80;
+    }
+
+    if (imageCount === 1) {
+      score += 18;
+    } else if (imageCount > 1) {
+      score -= 22 * Math.min(4, imageCount - 1);
+    }
+
+    const wrapsMedia = rect.left <= mediaRect.left + 6
+      && rect.top <= mediaRect.top + 6
+      && rect.right >= mediaRect.right - 6
+      && rect.bottom >= mediaRect.bottom - 6;
+    if (wrapsMedia) {
+      score += 18;
+    }
+
+    const paddingX = Math.max(0, (rect.width - mediaRect.width) / 2);
+    const paddingY = Math.max(0, (rect.height - mediaRect.height) / 2);
+    if (paddingX <= 80 && paddingY <= 80) {
+      score += 12;
+    }
+
+    if (element.querySelector("button, [role='button'], [aria-haspopup='menu']")) {
+      score += 8;
+    }
+
+    return score;
+  }
+
   function scoreMediaCardRoot(element) {
     const rect = element.getBoundingClientRect();
     const text = normalizeText(element.innerText || element.textContent || "");
@@ -2125,44 +2491,89 @@
   }
 
   function findCardMenuButton(cardRoot) {
-    const explicitMenuButtons = Array.from(
-      cardRoot.querySelectorAll("button[aria-haspopup='menu'], [role='button'][aria-haspopup='menu']")
-    )
-      .filter((element) => isVisible(element))
-      .map((element) => ({
-        element,
-        score: scoreCardMenuButton(element, cardRoot) + 20
-      }))
-      .sort((a, b) => b.score - a.score);
+    return getCardMenuButtonCandidates(cardRoot)[0] || null;
+  }
 
-    if (explicitMenuButtons[0]?.score >= 20) {
-      return explicitMenuButtons[0].element;
+  function getCardMenuButtonCandidates(cardRoot) {
+    const searchRoot = cardRoot instanceof HTMLElement ? cardRoot : null;
+    if (!searchRoot) {
+      return [];
     }
 
-    const buttons = Array.from(cardRoot.querySelectorAll("button, [role='button']"))
+    const parentScope = searchRoot?.parentElement instanceof HTMLElement ? searchRoot.parentElement : searchRoot;
+    const scopes = uniqueElements([searchRoot, parentScope].filter((element) => element instanceof HTMLElement));
+    const candidateButtons = uniqueElements(scopes.flatMap((scope) => Array.from(
+      scope.querySelectorAll("button, [role='button'], [aria-haspopup='menu']")
+    )))
+      .filter((element) => element instanceof HTMLElement)
       .filter((element) => isVisible(element))
+      .filter((element) => isElementInsideCardRect(element, searchRoot, 18));
+
+    const explicitMenuButtons = candidateButtons
+      .filter((element) =>
+        element.getAttribute("aria-haspopup") === "menu"
+        || element.getAttribute("data-state") === "closed"
+        || element.getAttribute("aria-controls")
+      )
       .map((element) => ({
         element,
-        score: scoreCardMenuButton(element, cardRoot)
+        score: scoreCardMenuButton(element, searchRoot) + 20
+      }))
+      .filter((entry) => entry.score > 20)
+      .sort((a, b) => b.score - a.score);
+
+    const scoredButtons = candidateButtons
+      .map((element) => ({
+        element,
+        score: scoreCardMenuButton(element, searchRoot)
       }))
       .filter((entry) => entry.score > 0)
       .sort((a, b) => b.score - a.score);
 
-    return buttons[0]?.score >= 18 ? buttons[0].element : null;
+    return uniqueElements([...explicitMenuButtons, ...scoredButtons].map((entry) => entry.element));
+  }
+
+  async function tryOpenCardMenu(cardRoot) {
+    const candidates = getCardMenuButtonCandidates(cardRoot).slice(0, 4);
+    if (candidates.length === 0) {
+      throw new Error("Không tìm thấy nút Tạo thêm trên card ảnh đã chọn.");
+    }
+
+    for (const menuButton of candidates) {
+      await clickElementRobustly(menuButton);
+      const menu = await waitForOptionalElement(() => findOpenCardMenu(menuButton), 900);
+      const downloadEntry = menu ? findDirectDownloadMenuItem(menu) : null;
+      if (menu && downloadEntry) {
+        return { menu, downloadEntry };
+      }
+
+      if (menu) {
+        await dismissOpenMenus();
+      }
+    }
+
+    return null;
   }
 
   function scoreCardMenuButton(element, cardRoot) {
     const rect = element.getBoundingClientRect();
     const cardRect = cardRoot.getBoundingClientRect();
     const text = normalizeText(getElementText(element));
+    const ariaLabel = normalizeText(element.getAttribute("aria-label"));
+    const title = normalizeText(element.getAttribute("title"));
+    const combinedText = `${text} ${ariaLabel} ${title}`;
     let score = 0;
 
-    if (text.includes("tạo thêm") || text.includes("more_vert") || text.includes("more")) {
-      score += 24;
+    if (combinedText.includes("tạo thêm") || combinedText.includes("more_vert") || combinedText.includes("more")) {
+      score += 34;
+    }
+
+    if (combinedText.includes("menu") || combinedText.includes("tuỳ chọn") || combinedText.includes("tùy chọn")) {
+      score += 12;
     }
 
     if (element.getAttribute("aria-haspopup") === "menu") {
-      score += 8;
+      score += 18;
     }
 
     if (rect.top <= cardRect.top + 80) {
@@ -2177,15 +2588,31 @@
       score += 6;
     }
 
-    if (text.includes("yêu thích") || text.includes("favorite") || text.includes("like")) {
-      score -= 14;
+    if (combinedText.includes("yêu thích") || combinedText.includes("favorite") || combinedText.includes("like")) {
+      score -= 30;
     }
 
-    if (text.includes("sử dụng lại") || text.includes("redo") || text.includes("undo")) {
-      score -= 14;
+    if (combinedText.includes("sử dụng lại") || combinedText.includes("redo") || combinedText.includes("undo")) {
+      score -= 30;
     }
 
     return score;
+  }
+
+  function isElementInsideCardRect(element, cardRoot, margin = 0) {
+    if (!(element instanceof HTMLElement) || !(cardRoot instanceof HTMLElement)) {
+      return false;
+    }
+
+    const rect = element.getBoundingClientRect();
+    const cardRect = cardRoot.getBoundingClientRect();
+    const centerX = rect.left + rect.width / 2;
+    const centerY = rect.top + rect.height / 2;
+
+    return centerX >= cardRect.left - margin
+      && centerX <= cardRect.right + margin
+      && centerY >= cardRect.top - margin
+      && centerY <= cardRect.bottom + margin;
   }
 
   function findOpenCardMenu(menuButton) {
@@ -2212,7 +2639,7 @@
     const startedAt = Date.now();
 
     while (Date.now() - startedAt < timeoutMs) {
-      const element = getter();
+      const element = await getter();
       if (element) {
         return element;
       }
@@ -2229,35 +2656,25 @@
     }
 
     element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    element.focus?.();
     const rect = element.getBoundingClientRect();
-    const clientX = rect.left + rect.width / 2;
-    const clientY = rect.top + rect.height / 2;
-    const mouseEventOptions = {
+    const eventOptions = {
       bubbles: true,
       cancelable: true,
       composed: true,
       view: window,
-      clientX,
-      clientY,
-      button: 0
+      clientX: rect.left + rect.width / 2,
+      clientY: rect.top + rect.height / 2
     };
 
-    const sequence = ["pointerenter", "mouseenter", "mouseover", "pointermove", "mousemove"];
-    element.focus?.();
-    for (const eventName of sequence) {
-      const EventCtor = eventName.startsWith("pointer") ? PointerEvent : MouseEvent;
-      element.dispatchEvent(new EventCtor(eventName, mouseEventOptions));
+    if (typeof PointerEvent === "function") {
+      element.dispatchEvent(new PointerEvent("pointerenter", { ...eventOptions, pointerId: 1, pointerType: "mouse", isPrimary: true }));
+      element.dispatchEvent(new PointerEvent("pointermove", { ...eventOptions, pointerId: 1, pointerType: "mouse", isPrimary: true }));
     }
 
-    try {
-      await runtimeSendMessage({
-        type: "FLOW_DEBUGGER_HOVER_AT",
-        payload: { x: clientX, y: clientY }
-      });
-    } catch (error) {
-      console.warn("Debugger hover fallback thất bại:", error);
-    }
-
+    element.dispatchEvent(new MouseEvent("mouseenter", eventOptions));
+    element.dispatchEvent(new MouseEvent("mouseover", eventOptions));
+    element.dispatchEvent(new MouseEvent("mousemove", eventOptions));
     await wait(FLOW_TIMING.directDownloadActionDelayMs);
   }
 
@@ -2265,38 +2682,7 @@
     if (!(element instanceof HTMLElement)) {
       throw new Error("Không click được menuitem 2K vì phần tử không hợp lệ.");
     }
-
-    const rect = element.getBoundingClientRect();
-    const clientX = rect.left + rect.width / 2;
-    const clientY = rect.top + rect.height / 2;
-
-    try {
-      await runtimeSendMessage({
-        type: "FLOW_DEBUGGER_CLICK_AT",
-        payload: { x: clientX, y: clientY }
-      });
-      await wait(FLOW_TIMING.directDownloadActionDelayMs);
-      return;
-    } catch (error) {
-      console.warn("Debugger click chính xác cho menuitem 2K thất bại, chuyển sang fallback:", error);
-    }
-
-    const mouseEventOptions = {
-      bubbles: true,
-      cancelable: true,
-      composed: true,
-      view: window,
-      clientX,
-      clientY,
-      button: 0
-    };
-
-    for (const eventName of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
-      const EventCtor = eventName.startsWith("pointer") ? PointerEvent : MouseEvent;
-      element.dispatchEvent(new EventCtor(eventName, mouseEventOptions));
-    }
-
-    element.click();
+    dispatchClickSequence(element);
     await wait(FLOW_TIMING.directDownloadActionDelayMs);
   }
 
@@ -2306,64 +2692,28 @@
     }
 
     element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
-    const rect = element.getBoundingClientRect();
-    const clientX = rect.left + rect.width / 2;
-    const clientY = rect.top + rect.height / 2;
-    const mouseEventOptions = {
-      bubbles: true,
-      cancelable: true,
-      composed: true,
-      view: window,
-      clientX,
-      clientY,
-      button: 0
-    };
-
-    const sequence = ["pointerdown", "mousedown", "pointerup", "mouseup", "click"];
     element.focus?.();
-    for (const eventName of sequence) {
-      const EventCtor = eventName.startsWith("pointer") ? PointerEvent : MouseEvent;
-      element.dispatchEvent(new EventCtor(eventName, mouseEventOptions));
+    dispatchClickSequence(element);
+    await wait(FLOW_TIMING.directDownloadActionDelayMs);
+
+    if (element.getAttribute("aria-expanded") === "true") {
+      return;
     }
+  }
 
-      element.click();
-      await wait(FLOW_TIMING.directDownloadActionDelayMs);
-
-      if (element.getAttribute("aria-expanded") === "true") {
-        return;
-      }
-
-    try {
-        await runtimeSendMessage({
-          type: "FLOW_DEBUGGER_CLICK_AT",
-          payload: { x: clientX, y: clientY }
-        });
-        await wait(FLOW_TIMING.directDownloadActionDelayMs);
-        if (element.getAttribute("aria-expanded") === "true") {
-          return;
-        }
-    } catch (error) {
-      console.warn("Debugger click fallback thất bại:", error);
-    }
-
-      element.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Enter" }));
-      element.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: "Enter" }));
-      await wait(FLOW_TIMING.directDownloadActionDelayMs);
-    }
-
-  function findDirectDownloadMenuItem() {
-    const openMenu = findOpenCardMenu();
+  function findDirectDownloadMenuItem(menuRoot = null) {
+    const openMenu = menuRoot instanceof HTMLElement ? menuRoot : findOpenCardMenu();
     const searchRoot = openMenu || document.body;
     const exactMenuItem = Array.from(searchRoot.querySelectorAll("[role='menuitem'], button, [role='button'], div[tabindex], li"))
       .filter((element) => isVisible(element))
       .find((element) => {
         const text = normalizeText(getElementText(element));
-        return text.includes("tải xuống") || text.includes("download tải xuống") || text === "download";
+        return isImageDownloadMenuText(text);
       });
 
     if (exactMenuItem) {
       const text = normalizeText(getElementText(exactMenuItem));
-      if (!text.includes("original size") && !text.includes("upscaled")) {
+      if (!isDownloadQualityText(text)) {
         return exactMenuItem;
       }
     }
@@ -2371,7 +2721,7 @@
     const direct = findActionButtonByLabels(["tải xuống", "download tải xuống", "download"], searchRoot);
     if (direct) {
       const text = normalizeText(getElementText(direct));
-      if (!text.includes("original size") && !text.includes("upscaled")) {
+      if (isImageDownloadMenuText(text) && !isDownloadQualityText(text)) {
         return direct;
       }
     }
@@ -2388,20 +2738,31 @@
     return candidates[0]?.score >= 14 ? candidates[0].element : null;
   }
 
+  async function dismissOpenMenus() {
+    const options = { bubbles: true, cancelable: true, key: "Escape", code: "Escape" };
+    document.dispatchEvent(new KeyboardEvent("keydown", options));
+    document.dispatchEvent(new KeyboardEvent("keyup", options));
+    await wait(160);
+  }
+
   function scoreDirectDownloadMenuItem(element) {
     const text = normalizeText(getElementText(element));
     const rect = element.getBoundingClientRect();
     let score = 0;
 
-    if (text.includes("tải xuống") || text.includes("download")) {
+    if (isImageDownloadMenuText(text)) {
       score += 26;
+    }
+
+    if (text.includes("dự án") || text.includes("project") || text.includes("ẩn") || text.includes("hidden")) {
+      score -= 30;
     }
 
     if (text.includes("đổi tên") || text.includes("cắt") || text.includes("sao chép") || text.includes("xóa") || text.includes("xoá")) {
       score -= 20;
     }
 
-    if (text.includes("original size") || text.includes("upscaled") || text === "1k" || text === "2k" || text === "4k") {
+    if (isDownloadQualityText(text)) {
       score -= 18;
     }
 
@@ -2412,7 +2773,32 @@
     return score;
   }
 
-  function findDownloadQualityOption(downloadEntry) {
+  function isImageDownloadMenuText(text) {
+    const value = normalizeText(text);
+    if (!value || value.includes("dự án") || value.includes("project") || value.includes("ẩn") || value.includes("hidden")) {
+      return false;
+    }
+
+    return value === "tải xuống"
+      || value === "download"
+      || value === "download tải xuống"
+      || value.includes("tải xuống")
+      || value.includes("download");
+  }
+
+  function isDownloadQualityText(text) {
+    const value = normalizeText(text);
+    return value.includes("original size")
+      || value.includes("upscaled")
+      || value.includes("kích thước gốc")
+      || value.includes("đã tăng độ phân giải")
+      || value === "1k"
+      || value === "2k"
+      || value === "4k";
+  }
+
+  function findDownloadQualityOption(downloadEntry, preferredQuality = "2k") {
+    const quality = normalizeDownloadQuality(preferredQuality);
     const downloadRect = downloadEntry instanceof HTMLElement ? downloadEntry.getBoundingClientRect() : null;
     const visibleMenuItems = Array.from(document.body.querySelectorAll("button[role='menuitem'], [role='menuitem']"))
       .filter((element) => isVisible(element))
@@ -2426,27 +2812,30 @@
         return hasRadixMarker || element.getAttribute("role") === "menuitem";
       });
 
-    const buttonBySpan2k = findQualityButtonParentBySpan(downloadRect, "2k");
-    if (buttonBySpan2k) {
-      return buttonBySpan2k;
+    const buttonBySpan = findQualityButtonParentBySpan(downloadRect, quality);
+    if (buttonBySpan) {
+      return buttonBySpan;
     }
 
-    const groupedMiddleButton = findMiddleQualityButtonFromTriplet(visibleMenuItems, downloadRect);
-    if (groupedMiddleButton) {
-      return groupedMiddleButton;
+    const groupedQualityButton = findQualityButtonFromTriplet(visibleMenuItems, downloadRect, quality);
+    if (groupedQualityButton) {
+      return groupedQualityButton;
     }
 
     const exactCandidates = visibleMenuItems.filter((element) => {
       const text = normalizeText(getElementText(element));
-      return text.includes("2k upscaled") || text === "2k";
+      return text.includes(`${quality} upscaled`)
+        || text.includes(`${quality} original size`)
+        || (text.includes(quality) && (text.includes("đã tăng độ phân giải") || text.includes("da tang do phan giai") || text.includes("kích thước gốc") || text.includes("kich thuoc goc")))
+        || text === quality;
     });
 
     if (exactCandidates.length > 0) {
       return exactCandidates.sort((a, b) => {
         const aRect = a.getBoundingClientRect();
         const bRect = b.getBoundingClientRect();
-        const aScore = scoreDownloadQualityOption(a, aRect, downloadRect);
-        const bScore = scoreDownloadQualityOption(b, bRect, downloadRect);
+        const aScore = scoreDownloadQualityOption(a, aRect, downloadRect, quality);
+        const bScore = scoreDownloadQualityOption(b, bRect, downloadRect, quality);
         return bScore - aScore;
       })[0];
     }
@@ -2483,15 +2872,16 @@
     const ranked = (filtered.length > 0 ? filtered : spanEntries).sort((a, b) => {
       const aRect = a.button.getBoundingClientRect();
       const bRect = b.button.getBoundingClientRect();
-      const aScore = scoreDownloadQualityOption(a.button, aRect, downloadRect);
-      const bScore = scoreDownloadQualityOption(b.button, bRect, downloadRect);
+      const aScore = scoreDownloadQualityOption(a.button, aRect, downloadRect, needle);
+      const bScore = scoreDownloadQualityOption(b.button, bRect, downloadRect, needle);
       return bScore - aScore;
     });
 
     return ranked[0]?.button || null;
   }
 
-  function findMiddleQualityButtonFromTriplet(menuItems, downloadRect) {
+  function findQualityButtonFromTriplet(menuItems, downloadRect, preferredQuality = "2k") {
+    const quality = normalizeDownloadQuality(preferredQuality);
     const candidates = menuItems
       .map((element) => {
         const spans = Array.from(element.querySelectorAll("span")).map((span) => normalizeText(span.textContent || ""));
@@ -2546,21 +2936,29 @@
       const bottomText = triplet[2].qualityToken;
 
       if (topText === "1k" && middleText === "2k" && bottomText === "4k") {
-        return triplet[1].element;
+        const match = triplet.find((entry) => entry.qualityToken === quality);
+        if (match) {
+          return match.element;
+        }
       }
     }
 
     return null;
   }
 
-  function scoreDownloadQualityOption(element, rect, downloadRect) {
+  function scoreDownloadQualityOption(element, rect, downloadRect, preferredQuality = "2k") {
     let score = 0;
+    const quality = normalizeDownloadQuality(preferredQuality);
     const text = normalizeText(getElementText(element));
     const menu = element.closest?.("[role='menu']");
 
-    if (text.includes("2k upscaled")) {
+    if (
+      text.includes(`${quality} upscaled`)
+      || text.includes(`${quality} original size`)
+      || (text.includes(quality) && (text.includes("đã tăng độ phân giải") || text.includes("da tang do phan giai") || text.includes("kích thước gốc") || text.includes("kich thuoc goc")))
+    ) {
       score += 60;
-    } else if (text === "2k") {
+    } else if (text === quality) {
       score += 25;
     }
 
@@ -2939,242 +3337,6 @@
     };
   }
 
-  function findCurrentOpenedImage() {
-    const candidates = Array.from(document.querySelectorAll("img"))
-      .filter((element) => {
-        if (!(element instanceof HTMLImageElement)) {
-          return false;
-        }
-
-        const rect = element.getBoundingClientRect();
-        const alt = normalizeText(element.alt || "");
-        return isVisible(element)
-          && rect.width >= 110
-          && rect.height >= 90
-          && rect.width * rect.height >= 12000
-          && rect.left >= 12
-          && rect.top >= 70
-          && rect.left < window.innerWidth * 0.35
-          && (alt.includes("hình ảnh được tạo") || alt.includes("generated image") || alt.includes("corgi") || Boolean(element.currentSrc || element.src));
-      })
-      .sort((a, b) => {
-        const aRect = a.getBoundingClientRect();
-        const bRect = b.getBoundingClientRect();
-        return (bRect.width * bRect.height) - (aRect.width * aRect.height);
-      });
-
-    return candidates[0] || null;
-  }
-
-  function isViewerOpen() {
-    if (findActionButtonByLabels(["tải xuống", "download", "xong", "done"], document.body)) {
-      return true;
-    }
-
-    const topButtons = Array.from(document.querySelectorAll("button, [role='button']"))
-      .filter((element) => isVisible(element))
-      .map((element) => ({
-        element,
-        rect: element.getBoundingClientRect(),
-        text: normalizeText(getElementText(element))
-      }))
-      .filter((entry) => entry.rect.top >= 0 && entry.rect.top < 96 && entry.rect.width >= 24 && entry.rect.height >= 24);
-
-    const leftToolbarButtons = topButtons.filter((entry) => entry.rect.left < window.innerWidth * 0.35);
-    const rightToolbarButtons = topButtons.filter((entry) => entry.rect.left > window.innerWidth * 0.45);
-    const largeViewerImage = findCurrentOpenedImage();
-
-    return Boolean(
-      largeViewerImage
-      && leftToolbarButtons.length >= 1
-      && rightToolbarButtons.length >= 2
-    );
-  }
-
-  function findCropToolButton() {
-    const explicit = findActionButtonByLabels(
-      ["crop cắt", "crop", "crop square", "crop_square", "cắt xén", "cắt"],
-      document.body
-    );
-    if (explicit) {
-      return explicit;
-    }
-
-    const viewerImage = findCurrentOpenedImage();
-    const baseScope = viewerImage?.closest("main, [role='dialog'], body") || document.body;
-    const candidates = Array.from(baseScope.querySelectorAll("button, [role='button']"))
-      .filter((element) => isVisible(element))
-      .filter((element) => {
-        const rect = element.getBoundingClientRect();
-        return rect.left < window.innerWidth * 0.18 && rect.top > 40 && rect.height >= 28 && rect.width >= 28;
-      })
-      .map((element) => ({
-        element,
-        score: scoreCropToolButton(element, viewerImage)
-      }))
-      .sort((a, b) => b.score - a.score);
-
-    return candidates[0]?.score >= 12 ? candidates[0].element : null;
-  }
-
-  function findSquareCropOption() {
-    const explicit = findActionButtonByLabels([
-      "vuông (1:1)",
-      "crop_square vuông (1:1)",
-      "crop_square",
-      "square (1:1)",
-      "1:1",
-      "vuông"
-    ], document.body);
-    if (explicit) {
-      return explicit;
-    }
-
-    const candidates = Array.from(document.querySelectorAll("[role='menuitem'], [role='option'], button, li, div[tabindex]"))
-      .filter((element) => isVisible(element))
-      .map((element) => ({
-        element,
-        score: scoreSquareCropOption(element)
-      }))
-      .filter((entry) => entry.score > 0)
-      .sort((a, b) => b.score - a.score);
-
-    return candidates[0]?.score >= 14 ? candidates[0].element : null;
-  }
-
-  function scoreCropToolButton(element, viewerImage) {
-    const rect = element.getBoundingClientRect();
-    const text = normalizeText(getElementText(element));
-    const ariaLabel = normalizeText(element.getAttribute?.("aria-label"));
-    const viewerRect = viewerImage?.getBoundingClientRect();
-    let score = 0;
-
-    if (
-      text.includes("crop cắt")
-      || text.includes("crop")
-      || text.includes("crop_square")
-      || text.includes("cắt xén")
-      || ariaLabel.includes("crop cắt")
-      || ariaLabel.includes("crop")
-    ) {
-      score += 22;
-    }
-
-    if (text === "cắt" || ariaLabel.includes("cắt")) {
-      score += 16;
-    }
-
-    if (rect.width >= 28 && rect.width <= 72 && rect.height >= 28 && rect.height <= 72) {
-      score += 8;
-    }
-
-    if (rect.top > 60 && rect.top < 180) {
-      score += 10;
-    }
-
-    if (rect.left > window.innerWidth * 0.18 && rect.left < window.innerWidth * 0.55) {
-      score += 12;
-    }
-
-    if (viewerRect) {
-      const horizontalGap = Math.abs(rect.left - viewerRect.left);
-      score += Math.max(0, 8 - horizontalGap / 50);
-    }
-
-    if (text.includes("download") || ariaLabel.includes("download")) {
-      score -= 18;
-    }
-
-    if (text.includes("check") || ariaLabel.includes("check") || text.includes("xong")) {
-      score -= 18;
-    }
-
-    return score;
-  }
-
-  function scoreSquareCropOption(element) {
-    const rect = element.getBoundingClientRect();
-    const text = normalizeText(getElementText(element));
-    let score = 0;
-
-    if (text.includes("vuông")) {
-      score += 12;
-    }
-
-    if (text.includes("1:1")) {
-      score += 12;
-    }
-
-    if (text.includes("crop_square") || text.includes("square")) {
-      score += 10;
-    }
-
-    if (text.includes("khổ")) {
-      score += 4;
-    }
-
-    if (rect.left < window.innerWidth * 0.3) {
-      score += 6;
-    }
-
-    if (rect.top > window.innerHeight * 0.2 && rect.top < window.innerHeight * 0.75) {
-      score += 4;
-    }
-
-    return score;
-  }
-
-  function findCheckButton() {
-    const explicit = findActionButtonByLabels(["check", "xong", "done"], document.body);
-    if (explicit) {
-      return explicit;
-    }
-
-    const candidates = Array.from(document.querySelectorAll("button, [role='button']"))
-      .filter((element) => isVisible(element))
-      .map((element) => ({
-        element,
-        score: scoreCheckButton(element)
-      }))
-      .filter((entry) => entry.score > 0)
-      .sort((a, b) => b.score - a.score);
-
-    return candidates[0]?.score >= 16 ? candidates[0].element : null;
-  }
-
-  function scoreCheckButton(element) {
-    const rect = element.getBoundingClientRect();
-    const text = normalizeText(getElementText(element));
-    const ariaLabel = normalizeText(element.getAttribute?.("aria-label"));
-    let score = 0;
-
-    if (text.includes("check") || ariaLabel.includes("check")) {
-      score += 18;
-    }
-
-    if (text.includes("xong") || ariaLabel.includes("xong") || text.includes("done") || ariaLabel.includes("done")) {
-      score += 14;
-    }
-
-    if (rect.top < window.innerHeight * 0.2) {
-      score += 10;
-    }
-
-    if (rect.left > window.innerWidth * 0.78) {
-      score += 10;
-    }
-
-    if (rect.width >= 28 && rect.width <= 64 && rect.height >= 28 && rect.height <= 64) {
-      score += 6;
-    }
-
-    if (text.includes("download") || ariaLabel.includes("download")) {
-      score -= 12;
-    }
-
-    return score;
-  }
-
   function findActionButtonByLabels(labels, scopeRoot = document.body) {
     const normalizedLabels = labels.map(normalizeText).filter(Boolean);
     const clickables = Array.from(
@@ -3192,7 +3354,7 @@
     const startedAt = Date.now();
 
     while (Date.now() - startedAt < timeoutMs) {
-      const element = getter();
+      const element = await getter();
       if (element) {
         return element;
       }
@@ -3276,6 +3438,42 @@
     element.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
+  function setContentEditableValue(element, value) {
+    element.focus?.();
+    const documentRef = element.ownerDocument || document;
+    const selection = window.getSelection?.();
+    const range = documentRef.createRange?.();
+
+    if (selection && range) {
+      range.selectNodeContents(element);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
+
+    let inserted = false;
+    if (typeof documentRef.execCommand === "function") {
+      try {
+        documentRef.execCommand("selectAll", false);
+      } catch (error) {
+        console.warn("Không selectAll được editor rich text:", error);
+      }
+
+      try {
+        inserted = documentRef.execCommand("insertText", false, value);
+      } catch (error) {
+        console.warn("Không insertText được editor rich text, chuyển sang fallback:", error);
+      }
+    }
+
+    if (!inserted) {
+      element.textContent = value;
+    }
+
+    element.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, data: value, inputType: "insertReplacementText" }));
+    element.dispatchEvent(new InputEvent("input", { bubbles: true, data: value, inputType: "insertReplacementText" }));
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
   function getElementText(element) {
     return (
       element.getAttribute?.("aria-label")
@@ -3319,18 +3517,6 @@
     }
 
     return element.matches("input, textarea, [contenteditable='true'], [role='textbox']");
-  }
-
-  function dispatchPromptEvents(element, value) {
-    element.dispatchEvent(new FocusEvent("focus", { bubbles: true }));
-    element.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true, data: "" }));
-    element.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, data: value, inputType: "insertText" }));
-    element.dispatchEvent(new InputEvent("input", { bubbles: true, data: value, inputType: "insertText" }));
-    element.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: value }));
-    element.dispatchEvent(new Event("change", { bubbles: true }));
-    element.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "a" }));
-    element.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: "a" }));
-    element.dispatchEvent(new FocusEvent("blur", { bubbles: true }));
   }
 
   function elementTextMatches(element, normalizedTargets) {
